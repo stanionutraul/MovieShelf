@@ -7,6 +7,17 @@ def build_movie_statistics(
     ratings: pd.DataFrame,
 ) -> pd.DataFrame:
     """Build one row of rating statistics per movie."""
+    unknown_movie_ids = (
+        set(ratings["movieId"]) - set(movies["movieId"])
+    )
+
+    if unknown_movie_ids:
+        raise ValueError(
+            "Ratings contain movieId values not found in movies: "
+            f"{sorted(unknown_movie_ids)}"
+        )
+
+
     rating_stats = (
         ratings.groupby("movieId")
         .agg(
