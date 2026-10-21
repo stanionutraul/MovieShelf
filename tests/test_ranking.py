@@ -2,7 +2,10 @@
 import pandas as pd
 import pytest
 
-from movieshelf.ranking import calculate_weighted_rating
+from movieshelf.ranking import (
+    calculate_weighted_rating,
+    recommend_top_movies,
+)
 
 
 def test_weighted_rating_moves_small_samples_toward_global_mean():
@@ -60,9 +63,33 @@ def test_weighted_rating_rejects_invalid_minimum_votes():
         }
     )
 
-    with pytest.raises(ValueError, match="minimum_votes must be positive"):
+    with pytest.raises(
+        ValueError,
+        match="minimum_votes must be positive",
+    ):
         calculate_weighted_rating(
             movies,
             global_mean=3.5,
             minimum_votes=0,
         )
+
+
+def test_recommend_top_movies_returns_highest_ranked_eligible_movies():
+    movies = pd.DataFrame(
+        {
+            "movieId": [1, 2, 3, 4],
+            "title": ["Film A", "Film B", "Film C", "Film D"],
+            "rating_count": [500, 2_000, 5_000, 3_000],
+            "average_rating": [4.9, 4.2, 4.5, 4.0],
+            "weighted_rating": [4.0, 4.1, 4.4, 3.9],
+        }
+    )
+
+    result = recommend_top_movies(
+        movies,
+        n=2,
+        minimum_votes=1_000,
+    )
+
+    assert result["movieId"].tolist() == [3, 2]
+    assert len(result) == 2
