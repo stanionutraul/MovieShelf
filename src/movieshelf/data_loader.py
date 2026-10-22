@@ -76,4 +76,37 @@ def load_ratings(data_dir: Path = DEFAULT_DATA_DIR) -> pd.DataFrame:
 
 
 
+def load_tags(data_dir: Path = DEFAULT_DATA_DIR) -> pd.DataFrame:
+    """Load MovieLens tags using memory-efficient data types."""
+    file_path = data_dir / "tags.csv"
+
+    if not file_path.is_file():
+        raise FileNotFoundError(
+            f"Tags file not found: {file_path}. "
+            "Check that the MovieLens dataset is extracted correctly."
+        )
+
+    tags = pd.read_csv(
+        file_path,
+        dtype={
+            "userId": "int32",
+            "movieId": "int32",
+            "timestamp": "int32",
+            "tag": "string",
+        },
+    )
+
+    required_columns = {"userId", "movieId", "tag", "timestamp"}
+    missing_columns = required_columns - set(tags.columns)
+
+    if missing_columns:
+        raise ValueError(
+            f"tags.csv is missing required columns: "
+            f"{', '.join(sorted(missing_columns))}"
+        )
+
+    return tags
+
+
+
          

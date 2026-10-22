@@ -2,7 +2,7 @@
 import pandas as pd
 import pytest
 
-from movieshelf.data_loader import load_movies, load_ratings
+from movieshelf.data_loader import load_movies, load_ratings, load_tags
 
 
 def test_load_movies_returns_expected_columns():
@@ -119,3 +119,55 @@ def test_load_ratings_rejects_missing_identifiers(tmp_path):
 
     with pytest.raises(ValueError, match="missing userId or movieId"):
         load_ratings(tmp_path)
+
+
+
+def test_load_tags_returns_expected_columns_and_types(tmp_path):
+    file_path = tmp_path / "tags.csv"
+
+    file_path.write_text(
+        "userId,movieId,tag,timestamp\n"
+        "1,10,War,1000\n"
+        "2,10,Realistic,2000\n",
+        encoding="utf-8",
+    )
+
+    result = load_tags(tmp_path)
+
+    assert list(result.columns) == [
+        "userId",
+        "movieId",
+        "tag",
+        "timestamp",
+    ]
+    assert len(result) == 2
+    assert str(result["userId"].dtype) == "int32"
+    assert str(result["movieId"].dtype) == "int32"
+    assert str(result["timestamp"].dtype) == "int32"
+    assert result["tag"].iloc[0] == "War"
+
+
+def test_load_tags_raises_for_missing_file(tmp_path):
+    try:
+        load_tags(tmp_path)
+    except FileNotFoundError as error:
+        assert "tags.csv" in str(error)
+    else:
+        raise AssertionError("Expected FileNotFoundError")
+
+
+def test_load_tags_raises_for_missing_columns(tmp_path):
+    file_path = tmp_path / "tags.csv"
+
+    file_path.write_text(
+        "userId,movieId,tag\n"
+        "1,10,War\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_tags(tmp_path)
+    except ValueError as error:
+        assert "timestamp" in str(error)
+    else:
+        raise AssertionError("Expected ValueError")
