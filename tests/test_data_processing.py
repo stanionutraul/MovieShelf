@@ -4,8 +4,10 @@ import pytest
 
 from movieshelf.data_processing import (
     build_movie_statistics,
+    build_movie_profiles,
     normalize_tags,
     summarize_movie_tags,
+
 )
 
 
@@ -183,3 +185,162 @@ def test_summarize_movie_tags_rejects_missing_columns():
 
     with pytest.raises(ValueError, match="tag"):
         summarize_movie_tags(tags)
+
+
+def test_build_movie_profiles_combines_title_genres_and_tags():
+    movies = pd.DataFrame({
+        "movieId": [1, 2],
+        "title": ["War Movie (2020)", "Space Movie (2021)"],
+        "genres": ["Action|War", "Sci-Fi"],
+    })
+    movie_tags = pd.DataFrame({
+        "movieId": [1, 1, 2],
+        "tag": ["realistic", "military", "space"],
+        "tag_count": [5, 3, 2],
+    })
+
+    result = build_movie_profiles(movies, movie_tags)
+
+    war_movie = result.loc[result["movieId"] == 1].iloc[0]
+
+    assert len(result) == 2
+    assert "War Movie (2020)" in war_movie["profile_text"]
+    assert "Action, War" in war_movie["profile_text"]
+    assert "realistic" in war_movie["profile_text"]
+    assert "military" in war_movie["profile_text"]
+
+
+def test_build_movie_profiles_handles_movies_without_tags():
+    movies = pd.DataFrame({
+        "movieId": [1, 2],
+        "title": ["War Movie (2020)", "Silent Movie (2021)"],
+        "genres": ["Action|War", "Drama"],
+    })
+    movie_tags = pd.DataFrame({
+        "movieId": [1],
+        "tag": ["military"],
+        "tag_count": [3],
+    })
+
+    result = build_movie_profiles(movies, movie_tags)
+
+    silent_movie = result.loc[result["movieId"] == 2].iloc[0]
+
+    assert len(result) == 2
+    assert "Silent Movie (2021)" in silent_movie["profile_text"]
+    assert "Drama" in silent_movie["profile_text"]
+    assert "military" not in silent_movie["profile_text"]
+
+
+def test_build_movie_profiles_limits_tags_to_30():
+    movies = pd.DataFrame({
+        "movieId": [1],
+        "title": ["War Movie (2020)"],
+        "genres": ["Action|War"],
+    })
+    movie_tags = pd.DataFrame({
+        "movieId": [1] * 32,
+        "tag": [f"tag_{i:02d}" for i in range(32)],
+        "tag_count": list(range(1, 33)),
+    })
+
+    result = build_movie_profiles(movies, movie_tags)
+    profile = result.iloc[0]["profile_text"]
+
+    assert "tag_31" in profile
+    assert "tag_30" in profile
+    assert "tag_01" not in profile
+    assert "tag_00" not in profile
+
+
+
+def test_build_movie_profiles_rejects_missing_movie_columns():
+    movies = pd.DataFrame({
+        "movieId": [1],
+        "title": ["War Movie (2020)"],
+    })
+    movie_tags = pd.DataFrame({
+        "movieId": [1],
+        "tag": ["military"],
+        "tag_count": [3],
+    })
+
+    with pytest.raises(ValueError, match="genres"):
+        build_movie_profiles(movies, movie_tags)
+
+
+def test_build_movie_profiles_rejects_missing_tag_columns():
+    movies = pd.DataFrame({
+        "movieId": [1],
+        "title": ["War Movie (2020)"],
+        "genres": ["Action|War"],
+    })
+    movie_tags = pd.DataFrame({
+        "movieId": [1],
+        "tag": ["military"],
+    })
+
+    with pytest.raises(ValueError, match="tag_count"):
+        build_movie_profiles(movies, movie_tags)
+
+
+def test_build_movie_profiles_rejects_nonpositive_max_tags():
+    movies = pd.DataFrame({
+        "movieId": [1],
+        "title": ["War Movie (2020)"],
+        "genres": ["Action|War"],
+    })
+    movie_tags = pd.DataFrame({
+        "movieId": [1],
+        "tag": ["military"],
+        "tag_count": [3],
+    })
+
+    with pytest.raises(ValueError, match="max_tags must be positive"):
+        build_movie_profiles(movies, movie_tags, max_tags=0)
+
+
+
+def test_repair_mojibake_fixes_single_encoding_error():
+    from movieshelf.data_processing import repair_mojibake
+
+    result = repair_mojibake("TÃ©a Leoni")
+
+    assert result == "Téa Leoni"
+
+
+def test_repair_mojibake_fixes_repeated_encoding_errors():
+    from movieshelf.data_processing import repair_mojibake
+
+    result = repair_mojibake("comedinha de velhinhos engraÃƒÂ§ada")
+
+    assert result == "comedinha de velhinhos engraçada"
+
+
+def test_repair_mojibake_preserves_correct_text():
+    from movieshelf.data_processing import repair_mojibake
+
+    result = repair_mojibake("Téa Leoni")
+
+    assert result == "Téa Leoni"
+
+
+def test_repair_mojibake_preserves_text_when_repair_fails():
+    from movieshelf.data_processing import repair_mojibake
+
+    text = "Gael GarcÃa Bernal"
+
+    result = repair_mojibake(text)
+
+    assert result == text
+
+
+
+def test_normalize_tags_repairs_mojibake_before_lowercasing():
+    from movieshelf.data_processing import normalize_tags
+
+    tags = pd.Series(["TÃ©a Leoni", "action"])
+
+    result = normalize_tags(tags)
+
+    assert result.tolist() == ["téa leoni", "action"]

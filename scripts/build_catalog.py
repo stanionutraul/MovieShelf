@@ -2,7 +2,7 @@
 from pathlib import Path
 
 from movieshelf.data_loader import load_movies, load_ratings, load_tags
-from movieshelf.data_processing import build_movie_statistics, summarize_movie_tags
+from movieshelf.data_processing import build_movie_profiles,build_movie_statistics, summarize_movie_tags
 from movieshelf.ranking import calculate_weighted_rating
 
 
@@ -16,6 +16,8 @@ OUTPUT_FILE = OUTPUT_DIR / "movie_catalog.csv"
 RANKING_OUTPUT_FILE = OUTPUT_DIR / "movie_catalog_ranked.csv"
 
 TAGS_OUTPUT_FILE = OUTPUT_DIR / "movie_tags.csv"
+
+PROFILES_OUTPUT_FILE = OUTPUT_DIR / "movie_profiles.csv"
 
 
 def main() -> None:
@@ -48,6 +50,14 @@ def main() -> None:
 
     movie_tags.to_csv(TAGS_OUTPUT_FILE, index=False)
     print(f"Movie tags saved to: {TAGS_OUTPUT_FILE}")
+
+    print("Building movie text profiles...")
+    movie_profiles = build_movie_profiles(movies, movie_tags)
+
+    movie_profiles.to_csv(PROFILES_OUTPUT_FILE, index=False)
+    print(f"Built {len(movie_profiles):,} movie profiles.")
+    print(f"Movie profiles saved to: {PROFILES_OUTPUT_FILE}")
+
 
     print("Calculating global mean rating...")
     global_mean = ratings["rating"].mean()
