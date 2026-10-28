@@ -232,7 +232,7 @@ def test_build_movie_profiles_handles_movies_without_tags():
     assert "military" not in silent_movie["profile_text"]
 
 
-def test_build_movie_profiles_limits_tags_to_30():
+def test_build_movie_profiles_limits_tags_to_100():
     movies = pd.DataFrame({
         "movieId": [1],
         "title": ["War Movie (2020)"],
@@ -249,8 +249,8 @@ def test_build_movie_profiles_limits_tags_to_30():
 
     assert "tag_31" in profile
     assert "tag_30" in profile
-    assert "tag_01" not in profile
-    assert "tag_00" not in profile
+    assert "tag_01" in profile
+    assert "tag_00" in profile
 
 
 
@@ -344,3 +344,44 @@ def test_normalize_tags_repairs_mojibake_before_lowercasing():
     result = normalize_tags(tags)
 
     assert result.tolist() == ["téa leoni", "action"]
+
+
+
+def test_build_movie_profiles_preserves_rare_relevant_tags():
+    import pandas as pd
+
+    from movieshelf.data_processing import build_movie_profiles
+
+    movies = pd.DataFrame(
+        {
+            "movieId": [1],
+            "title": ["Hurt Locker, The (2008)"],
+            "genres": ["Action|Drama|War"],
+        }
+    )
+
+    movie_tags = pd.DataFrame(
+        {
+            "movieId": [1] * 4,
+            "tag": [
+                "war",
+                "realistic",
+                "iraq war",
+                "bomb defusal",
+            ],
+            "tag_count": [100, 80, 60, 1],
+        }
+    )
+
+    profiles = build_movie_profiles(
+        movies,
+        movie_tags,
+        max_tags=4,
+    )
+
+    profile = profiles.loc[0, "profile_text"]
+
+    assert "war" in profile
+    assert "realistic" in profile
+    assert "iraq war" in profile
+    assert "bomb defusal" in profile

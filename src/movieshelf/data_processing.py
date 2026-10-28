@@ -99,7 +99,7 @@ def summarize_movie_tags(tags: pd.DataFrame) -> pd.DataFrame:
 def build_movie_profiles(
     movies: pd.DataFrame,
     movie_tags: pd.DataFrame,
-    max_tags: int = 30,
+    max_tags: int = 100,
 ) -> pd.DataFrame:
     """Build one text profile per movie using its title, genres, and tags."""
     if max_tags <= 0:

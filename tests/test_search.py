@@ -80,3 +80,42 @@ def test_search_rejects_non_positive_result_limit(movie_profiles):
 
     with pytest.raises(ValueError):
         engine.search("military", n=0)
+
+
+
+def test_search_includes_concept_coverage_score(movie_profiles):
+    engine = MovieSearchEngine(movie_profiles)
+
+    results = engine.search("military soldiers rescue mission", n=4)
+
+    assert "concept_coverage" in results.columns
+    assert results["concept_coverage"].between(0, 1).all()
+
+
+def test_search_prefers_profile_covering_more_query_terms():
+    profiles = pd.DataFrame(
+        {
+            "movieId": [1, 2],
+            "profile_text": [
+                "Rescue mission in a dangerous location.",
+                "Military soldiers on a rescue mission.",
+            ],
+        }
+    )
+
+    engine = MovieSearchEngine(profiles)
+    results = engine.search("military soldiers rescue mission", n=2)
+
+    assert results.iloc[0]["movieId"] == 2
+    assert (
+        results.iloc[0]["concept_coverage"]
+        > results.iloc[1]["concept_coverage"]
+    )
+
+
+def test_search_returns_empty_for_query_with_no_known_terms(movie_profiles):
+    engine = MovieSearchEngine(movie_profiles)
+
+    results = engine.search("xyzqv plmokn", n=5)
+
+    assert results.empty
