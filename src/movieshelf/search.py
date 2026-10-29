@@ -2,7 +2,10 @@
 import re
 
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import (
+    ENGLISH_STOP_WORDS,
+    TfidfVectorizer,
+)
 from sklearn.metrics.pairwise import cosine_similarity
 
 
@@ -39,8 +42,17 @@ class MovieSearchEngine:
 
     @staticmethod
     def _tokenize(text: str) -> list[str]:
-        """Extract lowercase word tokens from text."""
-        return re.findall(r"\b\w+\b", text.lower())
+        """Extract meaningful lowercase word tokens from text."""
+        tokens = re.findall(r"\b\w+\b", text.lower())
+
+        important_negations = {"not", "no", "without", "never"}
+        stop_words = ENGLISH_STOP_WORDS - important_negations
+
+        return [
+            token
+            for token in tokens
+            if token not in stop_words
+        ]
 
     @classmethod
     def _calculate_concept_coverage(
@@ -78,22 +90,22 @@ class MovieSearchEngine:
         results["similarity_score"] = scores
 
         results["concept_coverage"] = results["profile_text"].map(
-        lambda profile: self._calculate_concept_coverage(
-        query,
-        profile,
+            lambda profile: self._calculate_concept_coverage(
+                query,
+                profile,
+            )
         )
-    )
+
         results["final_score"] = (
-        0.60 * results["similarity_score"]
-        + 0.40 * results["concept_coverage"]
+            0.60 * results["similarity_score"]
+            + 0.40 * results["concept_coverage"]
         )
 
         results = results[results["similarity_score"] > 0]
 
         results = results.sort_values(
-        by=["final_score", "similarity_score", "movieId"],
-        ascending=[False, False, True],
-    )
-    
+            by=["final_score", "similarity_score", "movieId"],
+            ascending=[False, False, True],
+        )
 
         return results.head(n).reset_index(drop=True)
