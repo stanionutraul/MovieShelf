@@ -1,4 +1,10 @@
 
+import hashlib
+import json
+import os
+from pathlib import Path
+
+import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -6,6 +12,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 class SemanticMovieSearchEngine:
     """Rank movies by semantic relevance, rating confidence, and quality."""
+
+    CACHE_VERSION = 1
 
     def __init__(
         self,
@@ -15,6 +23,7 @@ class SemanticMovieSearchEngine:
         global_mean: float = 3.5404,
         semantic_weight: float = 0.80,
         confidence_votes: int = 1_000,
+        cache_dir: str | Path | None = None,
     ) -> None:
         if not 0 <= semantic_weight <= 1:
             raise ValueError("semantic_weight must be between 0 and 1.")
@@ -29,9 +38,7 @@ class SemanticMovieSearchEngine:
         missing = required - set(movie_profiles.columns)
 
         if missing:
-            raise ValueError(
-                f"Missing profile columns: {sorted(missing)}"
-            )
+            raise ValueError(f"Missing profile columns: {sorted(missing)}")
 
         profiles = movie_profiles.copy()
         profiles = profiles.dropna(subset=["profile_text"])
@@ -54,7 +61,6 @@ class SemanticMovieSearchEngine:
         self.global_mean = global_mean
         self.semantic_weight = semantic_weight
         self.confidence_votes = confidence_votes
-
         self.has_genre_data = False
 
         if movie_catalog is not None:
@@ -71,7 +77,6 @@ class SemanticMovieSearchEngine:
                     f"Missing catalog columns: {sorted(missing)}"
                 )
 
-            # Include genres and title when they are available.
             optional_columns = [
                 column
                 for column in ["title", "genres"]
@@ -101,19 +106,142 @@ class SemanticMovieSearchEngine:
             )
 
         self.profiles = profiles.reset_index(drop=True)
+        self.model_name = model_name
         self.model = SentenceTransformer(model_name)
+
+        if cache_dir is None:
+            cache_dir = (
+                Path(__file__).resolve().parents[2]
+                / "data"
+                / "processed"
+                / "embeddings"
+            )
+
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        self.profile_embeddings = self._load_or_create_embeddings()
+
+    def _calculate_profile_fingerprint(self) -> str:
+        """Create a fingerprint of the movie IDs and profile texts."""
+        profile_hashes = pd.util.hash_pandas_object(
+            self.profiles[["movieId", "profile_text"]],
+            index=False,
+        )
+
+        fingerprint = hashlib.sha256(
+            profile_hashes.to_numpy().tobytes()
+        ).hexdigest()
+
+        return fingerprint
+
+    def _load_or_create_embeddings(self) -> np.ndarray:
+        """Load valid cached embeddings or generate and save new ones."""
+        fingerprint = self._calculate_profile_fingerprint()
+
+        cache_key = hashlib.sha256(
+            self.model_name.encode("utf-8")
+        ).hexdigest()[:16]
+
+        embeddings_path = self.cache_dir / f"embeddings_{cache_key}.npy"
+        metadata_path = self.cache_dir / f"embeddings_{cache_key}.json"
+
+        expected_metadata = {
+            "cache_version": self.CACHE_VERSION,
+            "model_name": self.model_name,
+            "profile_fingerprint": fingerprint,
+            "row_count": len(self.profiles),
+        }
+
+        if embeddings_path.exists() and metadata_path.exists():
+            try:
+                with metadata_path.open("r", encoding="utf-8") as file:
+                    metadata = json.load(file)
+
+                if all(
+                    metadata.get(key) == value
+                    for key, value in expected_metadata.items()
+                ):
+                    embeddings = np.load(
+                        embeddings_path,
+                        allow_pickle=False,
+                    )
+
+                    if (
+                        embeddings.ndim == 2
+                        and embeddings.shape[0] == len(self.profiles)
+                        and np.isfinite(embeddings).all()
+                    ):
+                        print(
+                            f"Loaded cached embeddings: "
+                            f"{len(embeddings):,} movies."
+                        )
+                        return embeddings
+
+            except (OSError, ValueError, json.JSONDecodeError):
+                print("Embedding cache is invalid. Regenerating it.")
+
+        print(
+            f"Generating embeddings for {len(self.profiles):,} movies..."
+        )
 
         passages = [
             f"passage: {profile}"
             for profile in self.profiles["profile_text"]
         ]
 
-        self.profile_embeddings = self.model.encode(
+        embeddings = self.model.encode(
             passages,
             normalize_embeddings=True,
             show_progress_bar=True,
             convert_to_numpy=True,
         )
+
+        embeddings = np.asarray(embeddings, dtype=np.float32)
+
+        if (
+            embeddings.ndim != 2
+            or embeddings.shape[0] != len(self.profiles)
+            or not np.isfinite(embeddings).all()
+        ):
+            raise RuntimeError("Generated embeddings have an invalid shape or values.")
+
+        # Save to temporary files first, then replace the cache files.
+        temporary_embeddings = embeddings_path.with_name(
+            embeddings_path.name + ".tmp"
+        )
+        temporary_metadata = metadata_path.with_name(
+            metadata_path.name + ".tmp"
+        )
+
+        try:
+            with temporary_embeddings.open("wb") as file:
+                np.save(file, embeddings, allow_pickle=False)
+
+            with temporary_metadata.open("w", encoding="utf-8") as file:
+                json.dump(
+                    {
+                        **expected_metadata,
+                        "embedding_dimension": embeddings.shape[1],
+                        "dtype": str(embeddings.dtype),
+                    },
+                    file,
+                    indent=2,
+                )
+
+            os.replace(temporary_embeddings, embeddings_path)
+            os.replace(temporary_metadata, metadata_path)
+
+        finally:
+            if temporary_embeddings.exists():
+                temporary_embeddings.unlink()
+
+            if temporary_metadata.exists():
+                temporary_metadata.unlink()
+
+        print(f"Saved embeddings cache: {embeddings_path}")
+
+        return embeddings
 
     def search(
         self,
@@ -167,10 +295,8 @@ class SemanticMovieSearchEngine:
         results = self.profiles.copy()
         results["semantic_score"] = scores
 
-        # Remove candidates with no positive semantic similarity.
         results = results[results["semantic_score"] > 0].copy()
 
-        # Genre filters are hard constraints, not ranking preferences.
         if exclude_genres:
             excluded = {
                 genre.strip().casefold()
@@ -214,7 +340,6 @@ class SemanticMovieSearchEngine:
             ].copy()
 
         if self.has_rating_data:
-            # Missing rating counts are treated as zero.
             rating_count = results["rating_count"].fillna(0)
             average_rating = results["average_rating"]
 
@@ -234,8 +359,6 @@ class SemanticMovieSearchEngine:
                 rating_count = results["rating_count"].fillna(0)
                 average_rating = results["average_rating"]
 
-            # Shrink unreliable averages toward the global mean.
-            # This reduces the influence of films with very few votes.
             confidence = (
                 rating_count
                 / (rating_count + self.confidence_votes)
