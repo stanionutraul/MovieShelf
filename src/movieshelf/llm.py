@@ -15,6 +15,7 @@ class MovieShelfLLM:
 
         self.options = {
             "num_ctx": 4096,
+            "num_predict": 512,
         }
 
         self.keep_alive = "10m"
@@ -22,61 +23,88 @@ class MovieShelfLLM:
     def generate_response(self, prompt: str) -> str:
         response = self.client.chat(
             model=self.model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
             options=self.options,
             keep_alive=self.keep_alive,
         )
+
         self.log_performance(response, "LLM operation")
 
-        return response.message.content
+        return response.message.content or ""
 
-    def generate_structured(self, prompt: str, schema: type) -> dict:
+   
+    def generate_structured(self, prompt: str, schema: type) -> dict:   
         response = self.client.chat(
             model=self.model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
             format=schema.model_json_schema(),
+            think=False,
             options={
                 **self.options,
+                "num_predict": 1024,
                 "temperature": 0,
             },
             keep_alive=self.keep_alive,
         )
-        self.log_performance(response, "LLM operation")
 
-        content = response.message.content
+        self.log_performance(response, "Structured LLM operation")
 
-        if not content or not content.strip():
+        content = response.message.content or ""
+        thinking = getattr(response.message, "thinking", None) or ""
+
+        print(f"Thinking length: {len(thinking)} characters")
+        print(f"Content length: {len(content)} characters")
+
+        if not content.strip():
             raise RuntimeError(
-                f"Ollama returned an empty response. Model: {self.model}"
+                "Ollama returned an empty structured response. "
+                f"Model: {self.model}. "
+                f"Done reason: {getattr(response, 'done_reason', None)}. "
+                f"Thinking length: {len(thinking)}."
             )
 
         try:
             return schema.model_validate_json(content).model_dump()
+
         except Exception as error:
             raise RuntimeError(
-                f"Ollama returned invalid structured output.\n"
+                "Ollama returned invalid structured output.\n"
                 f"Raw response: {content!r}"
             ) from error
 
-    def chat_with_tools(
-    self,
-    messages: list[dict],
-    tools: list[dict],
-):
-        """Sends a conversation to Ollama with tool-calling support."""
-
+    def chat_with_tools(self, messages: list, tools: list):
         response = self.client.chat(
             model=self.model,
             messages=messages,
             tools=tools,
-            options=self.options,
+            think=False,
+            options={
+                **self.options,
+                "num_predict": 1024,
+            },
             keep_alive=self.keep_alive,
         )
 
         self.log_performance(response, "Chat with tools")
-        
-        return response
 
+        tool_calls = response.message.tool_calls or []
+
+        if not tool_calls:
+            content = response.message.content or ""
+
+            print("\n[TOOL CALL DIAGNOSTICS]")
+            print("No tool calls were generated.")
+            print("Generated content preview:")
+            print(content[:3000])
+
+        return response
     def log_performance(self, response, operation: str):
         metrics = {
             "total": response.total_duration / 1e9,
@@ -85,8 +113,17 @@ class MovieShelfLLM:
             "generation": response.eval_duration / 1e9,
         }
 
+        message = response.message
+        content = message.content or ""
+        thinking = getattr(message, "thinking", None) or ""
+        tool_calls = getattr(message, "tool_calls", None) or []
+
         print(f"\n[{operation}]")
         print(f"Total: {metrics['total']:.2f}s")
         print(f"Loading: {metrics['load']:.2f}s")
         print(f"Prompt processing: {metrics['prompt']:.2f}s")
         print(f"Generation: {metrics['generation']:.2f}s")
+        print(f"Done reason: {response.done_reason}")
+        print(f"Thinking length: {len(thinking)} characters")
+        print(f"Content length: {len(content)} characters")
+        print(f"Tool calls: {len(tool_calls)}")

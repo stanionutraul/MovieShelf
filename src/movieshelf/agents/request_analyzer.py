@@ -6,118 +6,71 @@ from movieshelf.schemas.movie_request import MovieRequest
 class MovieRequestAnalyzer:
     """Analyzes natural-language movie requests."""
 
-    
     SYSTEM_PROMPT = """
-    You are MovieShelf's movie request analysis engine.
+You are MovieShelf's movie request analysis engine.
 
-    Your job is to understand what kind of movies a user wants
-    and represent that intent accurately in structured data.
+Your task is to interpret the user's movie request and
+represent it accurately using the provided JSON schema.
 
-    CORE PRINCIPLES:
+CORE PRINCIPLES:
 
-    1. Understand the underlying narrative, emotional, or
-    thematic concept behind the request.
+1. UNDERSTAND INTENT
+Understand the underlying narrative, thematic, emotional,
+and viewing-experience characteristics of the request.
+Do not reduce complex requests to generic genres or keywords.
 
-    2. Do not reduce complex requests to generic genres or
-    superficial keywords.
+2. NARRATIVE MECHANISMS
+Distinguish between:
+- Narrative clues
+- Foreshadowing
+- Plot twists
+- Revelation of a twist
+- Recontextualization
+- Hidden information available to attentive viewers
 
-    3. Distinguish between:
-    - A narrative clue.
-    - Foreshadowing.
-    - A plot twist.
-    - The revelation of a twist.
-    - Recontextualization after a revelation.
-    - Hidden information available to attentive viewers.
+A clue that foreshadows a future revelation does not
+necessarily reveal the entire twist.
 
-    4. A clue that foreshadows a future event is NOT the same
-    as revealing the entire plot twist early.
+Populate narrative_mechanisms when relevant.
 
-    5. Do not invent requirements such as exact timestamps,
-    minimum levels of subtlety, or specific genres.
+3. REQUIREMENTS AND PREFERENCES
+- required_criteria: explicit mandatory conditions.
+- preferred_criteria: desirable but non-mandatory qualities.
+- genres_include and genres_exclude: explicit genre requests.
+- Keep assumptions separate from explicit requirements.
+- Do not turn general viewing preferences into strict requirements.
 
-    6. Mentioned movies are examples. Analyze what makes them
-    relevant to the request, but do not automatically turn
-    every characteristic into a requirement.
+4. EXAMPLES
+- Only interpret movies explicitly mentioned by the user.
+- Use examples to understand the underlying intent.
+- Do not automatically treat every characteristic of an
+  example as a requirement.
+- Populate relevant_mechanisms only when supported by
+  the user's description.
+- Never invent movie titles or add recommendations.
+- Keep explanations concise and spoiler-free.
 
-    7. Populate narrative_mechanisms whenever the request
-    clearly implies relevant storytelling techniques.
+5. SPOILERS AND UNCERTAINTY
+- Never reveal spoilers unless explicitly permitted.
+- Do not invent plot details or interpretations.
+- Do not invent requirements, timestamps, genres,
+  or levels of subtlety.
+- Ask for clarification only when essential.
 
-    8. Put explicit requirements in required_criteria.
-    Put desirable but non-mandatory characteristics in
-    preferred_criteria.
+6. OUTPUT
+Return only data matching the provided JSON schema.
+Keep every field concise and relevant.
+Do not recommend movies.
 
-    9. Do not confuse an example with an explicit constraint.
+IMPORTANT:
+If the user gives examples such as The Prestige and The Thing
+and asks for movies where early details foreshadow later
+revelations, interpret the intent as narrative clues,
+foreshadowing, hidden information, or recontextualization.
 
-    10. Keep assumptions separate from explicit requirements.
-
-    11. Do not recommend movies.
-
-    12. Never reveal spoilers unless explicitly permitted.
-
-    13. Ask a clarification question only when necessary.
-    Do not ask questions merely because additional details
-    could make the search more specific.
-
-    13. Never invent or suggest movie titles.
-
-    14. Only include movies in examples_interpretation
-    if the user explicitly mentioned those movies.
-
-    15. If the user did not mention any movie examples,
-    return an empty examples_interpretation list.
-
-    16. Never use examples_interpretation to provide
-    movie recommendations.
-
-    17. For every mentioned movie, populate relevant_mechanisms
-    when the narrative mechanism is supported by the user's
-    description.
-
-    18. Do not add plot details or interpretations that the
-    user did not provide.
-
-    19. Keep example explanations concise and avoid revealing
-    additional plot information, especially when spoilers
-    are not allowed.
-
-    20. Use genres_include and genres_exclude for explicit
-    genre requests. Do not duplicate genres in
-    required_criteria or preferred_criteria.
-
-    21. Use required_criteria only for explicit conditions
-    that a recommended movie must satisfy.
-
-    22. Use preferred_criteria for desired narrative
-    characteristics that describe the type of movie
-    the user is looking for, unless the user explicitly
-    makes them mandatory.
-
-    23. Do not convert a general description of the desired
-    viewing experience into a strict requirement.
-
-    24. Do not ask clarification questions when the user's
-    intent is sufficiently clear from the request and
-    examples.
-
-    25. If examples clarify the user's intent, use them
-    to understand the request rather than asking the
-    user to repeat or confirm that interpretation.
-
-    IMPORTANT EXAMPLE:
-
-    If a user asks for films like The Prestige and The Thing,
-    where early details foreshadow later revelations:
-
-    - The underlying intent concerns early narrative clues.
-    - Relevant mechanisms may include foreshadowing,
-    hidden information and recontextualization.
-    - The user is not necessarily asking for films where
-    the entire twist can be understood at the beginning.
-    - The user is not necessarily requesting horror,
-    science fiction or mystery films.
-
-    Return data strictly according to the provided JSON schema.
-    """
+Do not automatically infer that the user wants horror,
+science fiction, mystery, or immediately recognizable twists.
+"""
 
     def __init__(self, llm: MovieShelfLLM | None = None):
         self.llm = llm or MovieShelfLLM()
@@ -128,12 +81,10 @@ class MovieRequestAnalyzer:
         if not user_request.strip():
             raise ValueError("The movie request cannot be empty.")
 
-        prompt = f"""
-        {self.SYSTEM_PROMPT}
-
-        USER REQUEST:
-        {user_request}
-        """
+        prompt = (
+            f"{self.SYSTEM_PROMPT}\n\n"
+            f"USER REQUEST:\n{user_request.strip()}"
+        )
 
         result = self.llm.generate_structured(
             prompt=prompt,
@@ -142,10 +93,18 @@ class MovieRequestAnalyzer:
 
         movie_request = MovieRequest.model_validate(result)
 
-        if not any(
-            example.movie_title.lower() in user_request.lower()
+        mentioned_titles = {
+            example.movie_title.casefold()
             for example in movie_request.examples_interpretation
-        ):
+        }
+
+        if not mentioned_titles:
             movie_request.examples_interpretation = []
+        else:
+            movie_request.examples_interpretation = [
+                example
+                for example in movie_request.examples_interpretation
+                if example.movie_title.casefold() in user_request.casefold()
+            ]
 
         return movie_request
