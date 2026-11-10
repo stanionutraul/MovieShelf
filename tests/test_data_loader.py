@@ -2,7 +2,12 @@
 import pandas as pd
 import pytest
 
-from movieshelf.data_loader import load_movies, load_ratings, load_tags
+from movieshelf.data_loader import (
+    load_links,
+    load_movies,
+    load_ratings,
+    load_tags,
+)
 
 
 def test_load_movies_returns_expected_columns():
@@ -26,6 +31,38 @@ def test_load_movies_returns_non_empty_dataframe():
 def test_load_movies_raises_for_missing_file(tmp_path):
     with pytest.raises(FileNotFoundError, match="Movies file not found"):
         load_movies(tmp_path)
+
+
+def test_load_links_preserves_external_id_strings(tmp_path):
+    (tmp_path / "links.csv").write_text(
+        "movieId,imdbId,tmdbId\n"
+        "1,0114709,862\n"
+        "2,0000000,0\n",
+        encoding="utf-8",
+    )
+
+    links = load_links(tmp_path)
+
+    assert str(links["movieId"].dtype) == "int32"
+    assert str(links["imdbId"].dtype) == "string"
+    assert links["imdbId"].tolist() == ["0114709", "0000000"]
+
+
+def test_load_links_rejects_duplicate_movie_ids(tmp_path):
+    (tmp_path / "links.csv").write_text(
+        "movieId,imdbId,tmdbId\n"
+        "1,0114709,862\n"
+        "1,0114709,862\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate movieId"):
+        load_links(tmp_path)
+
+
+def test_load_links_raises_for_missing_file(tmp_path):
+    with pytest.raises(FileNotFoundError, match="Links file not found"):
+        load_links(tmp_path)
 
 
 def test_load_movies_rejects_missing_columns(tmp_path):

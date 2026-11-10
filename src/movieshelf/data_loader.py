@@ -108,5 +108,41 @@ def load_tags(data_dir: Path = DEFAULT_DATA_DIR) -> pd.DataFrame:
     return tags
 
 
+def load_links(data_dir: Path = DEFAULT_DATA_DIR) -> pd.DataFrame:
+    """Load MovieLens external movie identifiers."""
+    file_path = data_dir / "links.csv"
+
+    if not file_path.is_file():
+        raise FileNotFoundError(
+            f"Links file not found: {file_path}. "
+            "Check that the MovieLens dataset is extracted correctly."
+        )
+
+    links = pd.read_csv(
+        file_path,
+        dtype={
+            "movieId": "int32",
+            "imdbId": "string",
+            "tmdbId": "string",
+        },
+    )
+
+    required_columns = {"movieId", "imdbId", "tmdbId"}
+    missing_columns = required_columns - set(links.columns)
+    if missing_columns:
+        raise ValueError(
+            "links.csv is missing required columns: "
+            f"{', '.join(sorted(missing_columns))}"
+        )
+
+    if links["movieId"].isna().any():
+        raise ValueError("links.csv contains missing movieId values.")
+
+    if links["movieId"].duplicated().any():
+        raise ValueError("links.csv contains duplicate movieId values.")
+
+    return links
+
+
 
          

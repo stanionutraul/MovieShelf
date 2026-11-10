@@ -5,9 +5,27 @@ import pandas as pd
 class MovieCatalogTool:
     """Provides deterministic access to the MovieShelf movie catalog."""
 
-    def __init__(self, catalog_path, tags_path):
+    def __init__(self, catalog_path, tags_path, links=None):
         self.movies = pd.read_csv(catalog_path)
         self.tags = pd.read_csv(tags_path)
+
+        if links is not None:
+            required_link_columns = {"movieId", "imdbId"}
+            missing_columns = required_link_columns - set(links.columns)
+            if missing_columns:
+                raise ValueError(
+                    "Movie links are missing required columns: "
+                    f"{', '.join(sorted(missing_columns))}"
+                )
+            if links["movieId"].duplicated().any():
+                raise ValueError("Movie links contain duplicate movieId values.")
+
+            self.movies = self.movies.merge(
+                links[["movieId", "imdbId"]],
+                on="movieId",
+                how="left",
+                validate="one_to_one",
+            )
 
         self.movies["title_lower"] = (
             self.movies["title"].fillna("").str.lower()
@@ -39,25 +57,58 @@ class MovieCatalogTool:
     def filter_movies(
         self,
         include_genres=None,
+        genre_match="any",
         exclude_genres=None,
         min_rating_count=0,
         min_average_rating=None,
         limit=20,
     ):
         """Filter movies by genres and rating statistics."""
+        if not isinstance(genre_match, str) or genre_match not in {
+            "any",
+            "all",
+        }:
+            raise ValueError("genre_match must be either 'any' or 'all'.")
+
         results = self.movies.copy()
 
-        for genre in include_genres or []:
-            results = results[
-                results["genres"].str.contains(
-                    genre, case=False, regex=False, na=False
+        included = {
+            genre.strip().casefold()
+            for genre in include_genres or []
+            if isinstance(genre, str) and genre.strip()
+        }
+        if included:
+            movie_genres = results["genres"].fillna("").map(
+                lambda value: {
+                    genre.strip().casefold()
+                    for genre in str(value).split("|")
+                    if genre.strip()
+                }
+            )
+            if genre_match == "all":
+                genre_mask = movie_genres.map(included.issubset)
+            else:
+                genre_mask = movie_genres.map(
+                    lambda genres: not included.isdisjoint(genres)
                 )
-            ]
+            results = results[genre_mask]
 
-        for genre in exclude_genres or []:
+        excluded = {
+            genre.strip().casefold()
+            for genre in exclude_genres or []
+            if isinstance(genre, str) and genre.strip()
+        }
+        if excluded:
+            movie_genres = results["genres"].fillna("").map(
+                lambda value: {
+                    genre.strip().casefold()
+                    for genre in str(value).split("|")
+                    if genre.strip()
+                }
+            )
             results = results[
-                ~results["genres"].str.contains(
-                    genre, case=False, regex=False, na=False
+                movie_genres.map(
+                    lambda genres: excluded.isdisjoint(genres)
                 )
             ]
 
@@ -151,4 +202,3 @@ class MovieCatalogTool:
         )
 
         return self._records(results)
-

@@ -251,6 +251,7 @@ class SemanticMovieSearchEngine:
         include_genres: list[str] | None = None,
         min_rating_count: int = 0,
         min_average_rating: float | None = None,
+        genre_match: str = "any",
     ) -> pd.DataFrame:
         """Search semantically, with optional rating and genre filters."""
 
@@ -272,6 +273,12 @@ class SemanticMovieSearchEngine:
                 raise ValueError(
                     "min_average_rating must be between 0.5 and 5."
                 )
+
+        if not isinstance(genre_match, str) or genre_match not in {
+            "any",
+            "all",
+        }:
+            raise ValueError("genre_match must be either 'any' or 'all'.")
 
         exclude_genres = exclude_genres or []
         include_genres = include_genres or []
@@ -333,6 +340,8 @@ class SemanticMovieSearchEngine:
                     genre.strip().casefold()
                     for genre in value.split("|")
                 }
+                if genre_match == "all":
+                    return included.issubset(movie_genres)
                 return bool(movie_genres & included)
 
             results = results[

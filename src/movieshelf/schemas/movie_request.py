@@ -1,4 +1,6 @@
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -46,9 +48,25 @@ class MovieRequest(BaseModel):
         description="Genres explicitly requested."
     )
 
+    genres_match: Literal["any", "all"] = Field(
+        default="any",
+        description=(
+            "Whether included genres use OR ('any') or AND ('all') "
+            "matching. Defaults to 'any'."
+        ),
+    )
+
     genres_exclude: list[str] = Field(
         default_factory=list,
         description="Genres explicitly excluded."
+    )
+
+    content_avoidances: list[Literal["gore", "jump scares"]] = Field(
+        default_factory=list,
+        description=(
+            "Explicitly unwanted content types, populated only for clear "
+            "requests to avoid them."
+        ),
     )
 
     exclude: list[str] = Field(
