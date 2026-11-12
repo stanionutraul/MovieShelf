@@ -1,6 +1,8 @@
 import json
 from types import SimpleNamespace
 
+import pandas as pd
+
 from movieshelf.agents.recommendation_agent import RecommendationAgent
 from movieshelf.schemas.movie_request import MovieRequest
 from movieshelf.schemas.recommendation_context import RecommendationContext
@@ -214,6 +216,42 @@ def test_payload_contains_only_relevant_limited_movielens_tags():
     assert "not verified" in payload["catalog_evidence_note"]
 
 
+def test_payload_preserves_the_original_user_request():
+    original_request = (
+        "It's 3AM and I want a cozy movie that feels new and different."
+    )
+    context = _context()
+    context.original_request = original_request
+    agent = RecommendationAgent(
+        catalog_tool=FakeCatalogTool(),
+        llm=FakeLLM([]),
+    )
+
+    payload = json.loads(agent._build_user_message(context, []))
+
+    assert payload["recommendation_context"]["original_request"] == (
+        original_request
+    )
+
+
+def test_narrative_candidate_selection_excludes_unindexed_tag_matches():
+    indexed_movie = _movie(2)
+    unindexed_movie = _movie(1)
+    catalog = FakeCatalogTool()
+    agent = RecommendationAgent(
+        catalog_tool=catalog,
+        llm=FakeLLM([]),
+    )
+
+    candidates = agent._select_balanced_candidates(
+        [("cozy vibe", [unindexed_movie, indexed_movie])],
+        _context(),
+        allowed_movie_ids={2},
+    )
+
+    assert [candidate["movieId"] for candidate in candidates] == [2]
+
+
 def test_taste_profile_is_included_as_a_personalization_signal():
     taste = UserTasteContext(
         preferred_genres=["Drama"],
@@ -355,7 +393,7 @@ def test_distinct_synthetic_profiles_give_model_distinct_rating_examples():
     assert musical_taste["rated_movie_examples"][0]["title"] == "Cats"
 
 
-def test_taste_genre_rating_only_breaks_ties_after_query_match_breadth():
+def test_taste_genre_rating_does_not_override_tag_rank():
     catalog = FakeCatalogTool({
         "thoughtful": [
             _movie(10, genres="Drama"),
@@ -397,14 +435,13 @@ def test_taste_genre_rating_only_breaks_ties_after_query_match_breadth():
     candidates = agent._initial_retrieval(context)
 
     assert [candidate["movieId"] for candidate in candidates] == [
-        13,
         10,
         11,
         12,
+        13,
     ]
-    assert candidates[0]["taste_genre_match"]["average_rating"] == 1.5
-    assert candidates[1]["taste_genre_match"]["average_rating"] == 4.8
-    assert "taste_genre_match" not in candidates[2]
+    assert candidates[0]["taste_genre_match"]["average_rating"] == 4.8
+    assert candidates[-1]["taste_genre_match"]["average_rating"] == 1.5
 
 
 def test_personalization_scores_candidates_without_precomputed_relevance():
@@ -462,7 +499,7 @@ def test_multiple_tag_searches_prioritize_cross_query_matches():
         agent.INITIAL_CANDIDATE_LIMIT * agent.TAG_SEARCH_RESULT_MULTIPLIER,
     ] * 2
     assert [candidate["movieId"] for candidate in candidates] == [
-        50, 1, 2, 3, 4, 5, 6, 7,
+        50, 1, 9, 2, 10, 3, 11, 4,
     ]
     assert len(candidates) == agent.INITIAL_CANDIDATE_LIMIT
 
@@ -511,6 +548,143 @@ def test_multi_concept_match_beats_a_single_weak_tag_match():
     )
 
 
+def test_lexical_relevance_beats_an_incidental_tag_match():
+    context = _context(
+        narrative_mechanisms=[],
+        required_criteria=["cozy movie"],
+        preferred_criteria=[],
+    )
+    lexical_match = {
+        **_movie(99, title="Comforting Film (2020)"),
+        "retrieval_score": 0.2,
+    }
+    incidental_tag_match = _movie(1, title="Unrelated Film (2020)")
+    agent = RecommendationAgent(
+        catalog_tool=FakeCatalogTool({
+            "light-hearted": [incidental_tag_match],
+        }),
+        llm=FakeLLM([]),
+    )
+
+    candidates = agent._select_balanced_candidates(
+        [("light-hearted", [incidental_tag_match])],
+        context,
+        seed_candidates=[lexical_match],
+    )
+
+    assert candidates[0]["movieId"] == 99
+
+
+def test_catalog_search_ignores_unavailable_metadata_and_unseen_wording():
+    request = MovieRequest(
+        intent_summary=(
+            "User wants a new movie with a cozy vibe available on major "
+            "platforms with English subtitles."
+        ),
+        required_criteria=["new movie", "English subtitles available"],
+        preferred_criteria=["cozy vibe"],
+    )
+
+    query = RecommendationAgent._catalog_search_query(request)
+
+    assert "cozy" in query
+    assert "platform" not in query
+    assert "subtitles" not in query
+    assert "new" not in query
+    assert "different" not in query
+
+
+def test_search_candidates_apply_hard_year_and_genre_constraints():
+    class FakeSearchEngine:
+        def search(self, query, n):
+            assert "comedy" in query.casefold()
+            return pd.DataFrame([
+                {"movieId": 1, "final_score": 0.8},
+                {"movieId": 2, "final_score": 0.7},
+                {"movieId": 3, "final_score": 0.6},
+            ])
+
+    catalog = FakeCatalogTool()
+    catalog.movies = pd.DataFrame([
+        _movie(1, title="Funny Film (1988)", genres="Comedy|Drama"),
+        _movie(2, title="Funny Film (1994)", genres="Comedy|Drama"),
+        _movie(3, title="Funny Film (1987)", genres="Horror"),
+    ])
+    request = MovieRequest(
+        intent_summary="Comedy films from the 1980s.",
+        genres_include=["Comedy"],
+        release_year_from=1980,
+        release_year_to=1989,
+    )
+    context = RecommendationContext(movie_request=request)
+    agent = RecommendationAgent(
+        catalog_tool=catalog,
+        llm=FakeLLM([]),
+        search_engine=FakeSearchEngine(),
+    )
+
+    candidates = agent._search_catalog_candidates(request, context)
+
+    assert [candidate["movieId"] for candidate in candidates] == [1]
+    assert candidates[0]["retrieval_score"] == 0.8
+
+
+def test_search_candidates_use_semantic_relevance_not_rating_adjusted_score():
+    class SemanticSearchEngine:
+        def search(self, query, n):
+            return pd.DataFrame([
+                {
+                    "movieId": 1,
+                    "semantic_score": 0.61,
+                    "final_score": 0.82,
+                },
+            ])
+
+    catalog = FakeCatalogTool()
+    catalog.movies = pd.DataFrame([_movie(1)])
+    agent = RecommendationAgent(
+        catalog_tool=catalog,
+        llm=FakeLLM([]),
+        search_engine=SemanticSearchEngine(),
+    )
+
+    candidates = agent._search_catalog_candidates(
+        MovieRequest(intent_summary="A comforting story."),
+        RecommendationContext(movie_request=MovieRequest(
+            intent_summary="A comforting story.",
+        )),
+    )
+
+    assert candidates[0]["retrieval_score"] == 0.61
+
+
+def test_final_validation_rejects_recommendations_outside_requested_decade():
+    context = RecommendationContext(
+        movie_request=MovieRequest(
+            intent_summary="Comedy films from the 1980s.",
+            release_year_from=1980,
+            release_year_to=1989,
+        ),
+    )
+    candidates = {
+        1: _movie(1, title="Funny Film (1988)", genres="Comedy"),
+        2: _movie(2, title="Funny Film (1994)", genres="Comedy"),
+    }
+    agent = RecommendationAgent(
+        catalog_tool=FakeCatalogTool(),
+        llm=FakeLLM([]),
+    )
+
+    result = agent._render_validated_recommendations(
+        [{"movieId": 2, "description": "A comedy."}],
+        candidates,
+        context,
+    )
+
+    assert "Funny Film (1994)" not in result
+    assert "Nu am putut valida" in result
+
+
 def test_narrative_phrases_expand_to_catalog_tag_vocabulary():
     request = MovieRequest(
         intent_summary="A psychological film with shocking, unpredictable twists.",
@@ -534,6 +708,23 @@ def test_narrative_phrases_expand_to_catalog_tag_vocabulary():
     assert "unpredictable" in queries
     assert "twist" in queries
     assert "ambiguous" in queries
+
+
+def test_original_mood_request_expands_catalog_tag_searches():
+    request = MovieRequest(
+        intent_summary="User wants a movie to improve their mood.",
+        preferred_criteria=["lighten_mood"],
+    )
+
+    queries = RecommendationAgent._tag_search_queries(
+        request,
+        "I want to watch a movie to destress and lighten my mood.",
+    )
+
+    assert "heartwarming" in queries
+    assert "feel-good" in queries
+    assert "lighthearted" in queries
+    assert "warm" in queries
 
 
 def test_vampire_request_searches_subject_and_predatory_evidence_not_foreshadowing():
@@ -852,6 +1043,114 @@ def test_narrative_requests_use_only_candidates_with_verified_synopses():
     assert "narrative_source" not in json.dumps(final_payload)
 
 
+def test_local_plot_index_does_not_make_an_unhelpful_tool_chat_call():
+    class IndexedSynopsisTool(FakeSynopsisTool):
+        def movie_ids_with_status(self, status):
+            assert status == "available"
+            return set(self.synopses)
+
+    synopsis = {
+        "plot_summary": "A verified plot about a secret agency.",
+        "narrative_source": {
+            "title": "Example film",
+            "url": "https://en.wikipedia.org/wiki/Example_film",
+            "revision_url": (
+                "https://en.wikipedia.org/wiki/Example_film?oldid=123"
+            ),
+            "license_url": (
+                "https://creativecommons.org/licenses/by-sa/4.0/deed.en"
+            ),
+        },
+    }
+    catalog = FakeCatalogTool({
+        "secret agency": [_movie(10)],
+        "supernatural anomalies": [],
+    })
+    llm = FakeLLM([_final_response(10)])
+    agent = RecommendationAgent(
+        catalog_tool=catalog,
+        llm=llm,
+        synopsis_tool=IndexedSynopsisTool({10: synopsis}),
+    )
+
+    result = agent.run(_context())
+
+    assert "Catalog Movie 10" in result
+    assert llm.messages == []
+    assert len(llm.structured_prompts) == 1
+
+
+def test_candidate_prompt_caps_long_plot_sections():
+    record = RecommendationAgent._candidate_prompt_record({
+        "movieId": 1,
+        "plot_summary": "x" * 4000,
+    })
+
+    assert len(record["plot_summary"]) == 1203
+    assert record["plot_summary"].endswith("...")
+
+
+def test_final_prompt_stays_compact_and_preserves_request_and_taste():
+    original_request = (
+        "I need something warm and funny after a difficult week. "
+        "Please avoid bleak or violent stories."
+    )
+    context = _context()
+    context.original_request = original_request
+    context.taste_context = UserTasteContext(
+        watched_movie_ids=list(range(10000, 11000)),
+        preferred_genres=["Comedy"],
+        taste_summary="Enjoys warm, character-driven comedies.",
+        review_examples=[
+            {
+                "title": f"Review {index}",
+                "rating": 5,
+                "review": "x" * 1000,
+            }
+            for index in range(10)
+        ],
+        rated_movie_examples=[
+            {
+                "title": f"Rated {index}",
+                "rating": 5,
+                "genres": ["Comedy"],
+            }
+            for index in range(10)
+        ],
+    )
+    candidates = {
+        movie_id: {
+            **_movie(movie_id),
+            "plot_summary": "x" * 4000,
+            "retrieval_score": movie_id / 10,
+        }
+        for movie_id in range(10, 18)
+    }
+    llm = FakeLLM([_final_response(17)])
+    agent = RecommendationAgent(catalog_tool=FakeCatalogTool(), llm=llm)
+
+    agent._generate_final_answer(context, candidates)
+
+    prompt = llm.structured_prompts[0]
+    payload = json.loads(prompt)
+    prompt_context = payload["recommendation_context"]
+    prompt_taste = prompt_context["taste_context"]
+
+    assert len(prompt) < 12000
+    assert prompt_context["original_request"] == original_request
+    assert "watched_movie_ids" not in prompt_taste
+    assert len(prompt_taste["rated_movie_examples"]) == 6
+    assert len(prompt_taste["review_examples"]) == 3
+    assert len(prompt_taste["review_examples"][0]["review"]) == 300
+    assert len(payload["validated_catalog_candidates"]) == 4
+    assert all(
+        len(candidate["plot_summary"]) <= 603
+        for candidate in payload["validated_catalog_candidates"]
+    )
+    assert "tags" not in payload["validated_catalog_candidates"][0]
+    assert "retrieval_score" not in payload["validated_catalog_candidates"][0]
+
+
 def test_narrative_requests_stop_when_no_verified_synopsis_exists():
     catalog = FakeCatalogTool({
         "secret agency": [_movie(10)],
@@ -879,13 +1178,9 @@ def test_sourced_descriptions_are_limited_to_two_sentences():
     assert description == "First sentence. Second sentence!"
 
 
-def test_successful_tool_results_may_add_validated_candidates():
+def test_unranked_tool_results_are_not_recommended_outside_final_shortlist():
     initial = [_movie(movie_id) for movie_id in range(10, 17)]
-    added = [
-        _movie(20, title="Tool Result Movie (2018)"),
-        _movie(21, title="Second Tool Result (2019)"),
-        _movie(22, title="Third Tool Result (2021)"),
-    ]
+    added = [_movie(20, title="Tool Result Movie (2018)")]
     catalog = FakeCatalogTool(
         {"secret agency": initial, "supernatural anomalies": []},
         search_results=added,
@@ -905,14 +1200,14 @@ def test_successful_tool_results_may_add_validated_candidates():
 
     result = agent.run(_context())
 
-    assert "Tool Result Movie (2018)" in result
+    assert "Tool Result Movie (2018)" not in result
+    assert "Nu am putut valida nicio recomandare" in result
     assert catalog.search_calls == [{"query": "Tool Result Movie"}]
     final_prompt = json.loads(llm.structured_prompts[-1])
     transmitted_candidates = final_prompt["validated_catalog_candidates"]
-    assert len(transmitted_candidates) == agent.INITIAL_CANDIDATE_LIMIT
+    assert len(transmitted_candidates) == agent.MAX_PROMPT_CANDIDATES
     transmitted_ids = [
         candidate["movieId"]
         for candidate in transmitted_candidates
     ]
-    assert 20 in transmitted_ids
-    assert 21 not in transmitted_ids
+    assert 20 not in transmitted_ids

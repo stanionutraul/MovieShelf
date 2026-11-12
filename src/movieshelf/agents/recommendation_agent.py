@@ -3,7 +3,7 @@ import json
 import logging
 import math
 import re
-from typing import Any
+from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
 
@@ -11,10 +11,22 @@ from movieshelf.llm import MovieShelfLLM
 from movieshelf.schemas.recommendation_context import RecommendationContext
 from movieshelf.schemas.user_taste import UserTasteContext
 from movieshelf.tools.movie_catalog_tool import MovieCatalogTool
-from movieshelf.tools.wikipedia_synopsis_tool import WikipediaSynopsisTool
 
 
 logger = logging.getLogger(__name__)
+
+
+class MovieCatalogSearchEngine(Protocol):
+    def search(self, query: str, n: int = 10) -> Any:
+        ...
+
+
+class CandidateEnricher(Protocol):
+    def enrich_candidates(
+        self,
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        ...
 
 
 class MovieRecommendation(BaseModel):
@@ -37,9 +49,46 @@ class RecommendationAgent:
 
     MAX_TOOL_CALLS = 5
     INITIAL_CANDIDATE_LIMIT = 8
+    RETRIEVAL_CANDIDATE_LIMIT = 100
     TAG_SEARCH_RESULT_MULTIPLIER = 4
     MAX_TAGS_PER_CANDIDATE = 5
+    MAX_PLOT_PROMPT_CHARACTERS = 1200
+    MAX_FINAL_PLOT_PROMPT_CHARACTERS = 600
+    MAX_PROMPT_CANDIDATES = 4
+    MAX_TASTE_REVIEWS_IN_PROMPT = 3
+    MAX_TASTE_REVIEW_CHARACTERS = 300
     TAG_QUERY_EXPANSIONS = (
+        (
+            "cozy",
+            (
+                "warm",
+                "heartwarming",
+                "feel-good",
+                "feel good",
+                "lighthearted",
+                "comforting",
+            ),
+        ),
+        (
+            "uplifting",
+            ("heartwarming", "feel-good", "feel good", "lighthearted", "warm"),
+        ),
+        (
+            "light mood",
+            ("heartwarming", "feel-good", "feel good", "lighthearted", "warm"),
+        ),
+        (
+            "mood-boosting",
+            ("heartwarming", "feel-good", "feel good", "lighthearted", "warm"),
+        ),
+        (
+            "destress",
+            ("heartwarming", "feel-good", "feel good", "lighthearted", "warm"),
+        ),
+        (
+            "minimal stress",
+            ("feel-good", "feel good", "lighthearted", "silly", "funny"),
+        ),
         ("vampire", ("vampire",)),
         ("predatory", ("blood",)),
         ("bloodthirsty", ("blood",)),
@@ -77,6 +126,8 @@ class RecommendationAgent:
         "rating_count",
         "tags",
         "matched_queries",
+        "retrieval_score",
+        "request_relevance_score",
         "plot_summary",
         "taste_genre_match",
     }
@@ -119,15 +170,18 @@ IMPORTANT RULES:
 10. Use the user's taste_summary, preferred_genres, and review_examples
     as preference signals, not as mandatory filters. The current request
     and its explicit filters take priority.
-11. Use rated_movie_examples only as examples of the user's taste. Their
+11. Separate the user's personal circumstances from the movie qualities
+    they ask for. Do not treat hardship mentioned as context as a request
+    for a movie about the same hardship.
+12. Use rated_movie_examples only as examples of the user's taste. Their
     genres are catalog metadata; ratings do not prove why the user liked or
     disliked a film. Do not infer plot facts from these examples.
-12. Use taste_genre_match only as a soft tie-breaker between candidates
+13. Use taste_genre_match only as a soft tie-breaker between candidates
     that are similarly relevant to the current request.
-13. Treat review_examples as the user's opinions, not verified plot facts.
-14. If the available data cannot verify a criterion, explicitly say so.
-15. Respond in the same language as the user's request.
-16. Do not reveal internal reasoning, tool plans, or implementation details.
+14. Treat review_examples as the user's opinions, not verified plot facts.
+15. If the available data cannot verify a criterion, explicitly say so.
+16. Respond in the same language as the user's request.
+17. Do not reveal internal reasoning, tool plans, or implementation details.
 
 TOOL USAGE:
 
@@ -157,11 +211,13 @@ information to verify a narrative requirement.
         self,
         catalog_tool: MovieCatalogTool,
         llm: MovieShelfLLM | None = None,
-        synopsis_tool: WikipediaSynopsisTool | None = None,
+        synopsis_tool: CandidateEnricher | None = None,
+        search_engine: MovieCatalogSearchEngine | None = None,
     ):
         self.catalog_tool = catalog_tool
         self.llm = llm or MovieShelfLLM()
         self.synopsis_tool = synopsis_tool
+        self.search_engine = search_engine
 
         self.tool_functions = {
             "search_movies": self.catalog_tool.search_movies,
@@ -426,7 +482,10 @@ information to verify a narrative requirement.
             or movie_request.examples_interpretation
             or movie_request.intent_summary.strip()
         ):
-            queries = self._tag_search_queries(movie_request)
+            queries = self._tag_search_queries(
+                movie_request,
+                context.original_request or "",
+            )
             query_results = []
             for query in queries:
                 matches = self.catalog_tool.get_movies_by_tags(
@@ -445,9 +504,17 @@ information to verify a narrative requirement.
 
                 query_results.append((query, normalized_matches))
 
+            lexical_candidates = self._search_catalog_candidates(
+                movie_request,
+                context,
+            )
             candidates = self._select_balanced_candidates(
                 query_results,
                 context,
+                seed_candidates=lexical_candidates,
+                allowed_movie_ids=(
+                    self._available_narrative_movie_ids(context)
+                ),
             )
 
             if (
@@ -469,6 +536,12 @@ information to verify a narrative requirement.
 
         elif context.filters:
             candidates = self._genre_filtered_catalog(context)
+
+        elif movie_request and self.search_engine is not None:
+            candidates = self._search_catalog_candidates(
+                movie_request,
+                context,
+            )
 
         elif taste_context:
             preferred_genres = taste_context.preferred_genres
@@ -517,6 +590,116 @@ information to verify a narrative requirement.
             candidates,
             taste_context,
         )
+
+    def _search_catalog_candidates(
+        self,
+        movie_request,
+        context: RecommendationContext,
+    ) -> list[dict]:
+        if self.search_engine is None:
+            return []
+
+        query = self._catalog_search_query(movie_request)
+        if not query:
+            return []
+
+        results = self.search_engine.search(
+            query,
+            n=self.RETRIEVAL_CANDIDATE_LIMIT,
+        )
+        movies = getattr(self.catalog_tool, "movies", None)
+        if movies is None or not hasattr(movies, "to_dict"):
+            return []
+
+        catalog_records = {
+            self._get_movie_id(record): record
+            for record in movies.to_dict(orient="records")
+            if isinstance(record, dict)
+        }
+        taste = context.taste_context
+        watched_ids = set(taste.watched_movie_ids) if taste else set()
+        candidates = []
+
+        for result in results.to_dict(orient="records"):
+            movie_id = self._get_movie_id(result)
+            movie = catalog_records.get(movie_id)
+            if (
+                movie is None
+                or movie_id in watched_ids
+                or not self._matches_explicit_filters(movie, context)
+            ):
+                continue
+
+            candidates.append({
+                **movie,
+                "retrieval_score": float(
+                    result["semantic_score"]
+                    if "semantic_score" in result
+                    else result["final_score"]
+                ),
+            })
+
+        return candidates
+
+
+    def _available_narrative_movie_ids(
+        self,
+        context: RecommendationContext,
+    ) -> set[int] | None:
+        if (
+            self.synopsis_tool is None
+            or not self._requires_narrative_uncertainty(context)
+        ):
+            return None
+
+        get_movie_ids = getattr(
+            self.synopsis_tool,
+            "movie_ids_with_status",
+            None,
+        )
+        if not callable(get_movie_ids):
+            return None
+
+        return get_movie_ids("available")
+
+
+    @classmethod
+    def _catalog_search_query(cls, movie_request) -> str:
+        unsupported_metadata_terms = {
+            "available", "availability", "english", "different",
+            "major", "new", "platform", "platforms", "region",
+            "regions", "series", "show", "shows", "streaming",
+            "subtitle", "subtitles", "tv",
+        }
+        phrases = [
+            *movie_request.required_criteria,
+            *movie_request.preferred_criteria,
+            *movie_request.genres_include,
+        ]
+        if not phrases:
+            phrases.append(movie_request.intent_summary)
+        words = []
+        seen = set()
+        for phrase in phrases:
+            for word in re.findall(r"[A-Za-z0-9'-]+", phrase):
+                normalized = word.casefold()
+                if (
+                    normalized in unsupported_metadata_terms
+                    or normalized in seen
+                ):
+                    continue
+                seen.add(normalized)
+                words.append(word.replace("_", " "))
+
+        for year in (
+            movie_request.release_year_from,
+            movie_request.release_year_to,
+        ):
+            if year is not None and str(year) not in seen:
+                words.append(str(year))
+                seen.add(str(year))
+
+        return " ".join(words[:32])
 
 
     @classmethod
@@ -595,22 +778,45 @@ information to verify a narrative requirement.
         self,
         query_results: list[tuple[str, list[dict]]],
         context: RecommendationContext,
+        seed_candidates: list[dict] | None = None,
+        allowed_movie_ids: set[int] | None = None,
     ) -> list[dict]:
-        """Prioritize candidates supported by multiple request concepts."""
+        """Rank full-text matches, with matching tags as additional evidence."""
 
         candidates_by_id = {}
         first_seen_order = {}
+        for semantic_rank, record in enumerate(
+            seed_candidates or [],
+            start=1,
+        ):
+            movie_id = self._get_movie_id(record)
+            if (
+                movie_id is None
+                or (
+                    allowed_movie_ids is not None
+                    and movie_id not in allowed_movie_ids
+                )
+            ):
+                continue
+            candidate = dict(record)
+            candidate["semantic_rank"] = semantic_rank
+            candidates_by_id[movie_id] = candidate
+            first_seen_order[movie_id] = len(first_seen_order)
 
         for query, records in query_results:
             seen_in_query = set()
 
-            for record in records:
+            for tag_rank, record in enumerate(records, start=1):
                 if not isinstance(record, dict):
                     continue
 
                 movie_id = self._get_movie_id(record)
                 if (
                     movie_id is None
+                    or (
+                        allowed_movie_ids is not None
+                        and movie_id not in allowed_movie_ids
+                    )
                     or movie_id in seen_in_query
                     or (
                         context.taste_context
@@ -630,12 +836,21 @@ information to verify a narrative requirement.
                 matched_queries = candidate.setdefault("matched_queries", [])
                 if query not in matched_queries:
                     matched_queries.append(query)
+                candidate.setdefault("tag_ranks", {})[query] = tag_rank
 
         for candidate in candidates_by_id.values():
-            matched_queries = candidate.get("matched_queries", [])
-            candidate["request_relevance_score"] = sum(
-                self._query_specificity(query)
-                for query in matched_queries
+            semantic_rank = candidate.get("semantic_rank")
+            semantic_score = (
+                2 / (60 + semantic_rank)
+                if isinstance(semantic_rank, int)
+                else 0.0
+            )
+            tag_score = sum(
+                self._query_specificity(query) / (60 + rank)
+                for query, rank in candidate.get("tag_ranks", {}).items()
+            )
+            candidate["request_relevance_score"] = (
+                semantic_score + tag_score
             )
 
         selected_ids = sorted(
@@ -739,11 +954,16 @@ information to verify a narrative requirement.
 
 
     @classmethod
-    def _tag_search_queries(cls, movie_request) -> list[str]:
+    def _tag_search_queries(
+        cls,
+        movie_request,
+        original_request: str = "",
+    ) -> list[str]:
         """Extract a few focused tag queries from the structured request."""
 
         supporting_text = " ".join([
             movie_request.intent_summary,
+            original_request,
             *movie_request.required_criteria,
             *movie_request.preferred_criteria,
         ])
@@ -776,7 +996,11 @@ information to verify a narrative requirement.
         ignored_words = {
             "about", "after", "also", "and", "deals", "from",
             "into", "looking", "movies", "movie", "that", "their",
-            "these", "this", "those", "with", "without",
+            "these", "this", "those", "with", "without", "new",
+            "different", "available", "availability", "english",
+            "major", "platform", "platforms", "region", "regions",
+            "series", "show", "shows", "streaming", "subtitle",
+            "subtitles", "tv",
         }
         queries = []
 
@@ -966,9 +1190,26 @@ information to verify a narrative requirement.
 
         year_from = filters.get("release_year_from")
         year_to = filters.get("release_year_to")
+        request = context.movie_request
+        if request and request.release_year_from is not None:
+            year_from = max(
+                year_from or request.release_year_from,
+                request.release_year_from,
+            )
+        if request and request.release_year_to is not None:
+            year_to = min(
+                year_to or request.release_year_to,
+                request.release_year_to,
+            )
+        if (
+            year_from is not None
+            and year_to is not None
+            and year_from > year_to
+        ):
+            return False
         if year_from is not None or year_to is not None:
             title = movie.get("title", "")
-            year_match = re.search(r"\((\d{4})\)", title)
+            year_match = re.search(r"\((\d{4})\)\s*$", title)
             if not year_match:
                 return False
 
@@ -1026,12 +1267,16 @@ information to verify a narrative requirement.
     ) -> str:
         """Build the context sent to Qwen."""
 
-        context_data = context.model_dump(mode="json")
+        context_data = self._prompt_context_data(context)
         compact_candidates = [
-            self._candidate_prompt_record(candidate)
-            for candidate in initial_candidates
-            if isinstance(candidate, dict)
-        ]
+            self._candidate_prompt_record(
+                candidate,
+                max_plot_characters=800,
+            )
+            for candidate in self._rank_prompt_candidates(
+                initial_candidates
+            )
+        ][:self.MAX_PROMPT_CANDIDATES]
 
         payload = {
             "recommendation_context": context_data,
@@ -1039,12 +1284,15 @@ information to verify a narrative requirement.
             "catalog_evidence_note": (
                 "MovieLens tags are user-contributed clues, not verified "
                 "plot descriptions. When present, plot_summary is the "
-                "English Wikipedia lead for the exact IMDb-linked title."
+                "attributed plot section for the exact IMDb-linked title."
             ),
             "instructions": (
                 "The recommendation_context contains the user's complete "
                 "request. Evaluate only the supplied catalog candidates "
-                "against mandatory criteria and preferences. Python has "
+                "against mandatory criteria and preferences. Candidates with "
+                "higher request_relevance_score have stronger full-text or "
+                "tag evidence for the request. Do not select candidates just "
+                "because of a weak, incidental tag match. Python has "
                 "already performed the initial searches and verifiable "
                 "filters; tool calls are optional for additional data. "
                 "When a taste profile is present, use it to personalize "
@@ -1068,7 +1316,68 @@ information to verify a narrative requirement.
         )
 
     @classmethod
-    def _candidate_prompt_record(cls, candidate: dict) -> dict:
+    def _prompt_context_data(
+        cls,
+        context: RecommendationContext,
+    ) -> dict:
+        """Omit identifiers and excess history already handled by Python."""
+
+        data = context.model_dump(mode="json")
+        taste = data.get("taste_context")
+        if not isinstance(taste, dict):
+            return data
+
+        for field in (
+            "liked_movie_ids",
+            "disliked_movie_ids",
+            "watched_movie_ids",
+        ):
+            taste.pop(field, None)
+
+        taste["rated_movie_examples"] = taste.get(
+            "rated_movie_examples",
+            [],
+        )[:6]
+        taste["review_examples"] = [
+            {
+                **review,
+                "review": review.get("review", "")[
+                    :cls.MAX_TASTE_REVIEW_CHARACTERS
+                ],
+            }
+            for review in taste.get("review_examples", [])[
+                :cls.MAX_TASTE_REVIEWS_IN_PROMPT
+            ]
+            if isinstance(review, dict)
+        ]
+        return data
+
+    @staticmethod
+    def _rank_prompt_candidates(candidates: list[dict]) -> list[dict]:
+        return sorted(
+            (
+                candidate
+                for candidate in candidates
+                if isinstance(candidate, dict)
+            ),
+            key=lambda candidate: (
+                -float(
+                    candidate.get(
+                        "request_relevance_score",
+                        candidate.get("retrieval_score", 0.0),
+                    )
+                    or 0.0
+                ),
+                str(candidate.get("title", "")).casefold(),
+            ),
+        )
+
+    @classmethod
+    def _candidate_prompt_record(
+        cls,
+        candidate: dict,
+        max_plot_characters: int | None = None,
+    ) -> dict:
         """Keep prompt evidence compact and omit ranking-only fields."""
 
         compact = {
@@ -1077,6 +1386,20 @@ information to verify a narrative requirement.
             if key in cls.CANDIDATE_PROMPT_FIELDS
             and key != "tags"
         }
+        plot_summary = compact.get("plot_summary")
+        plot_limit = (
+            cls.MAX_PLOT_PROMPT_CHARACTERS
+            if max_plot_characters is None
+            else max_plot_characters
+        )
+        if (
+            isinstance(plot_summary, str)
+            and len(plot_summary) > plot_limit
+        ):
+            compact["plot_summary"] = (
+                plot_summary[:plot_limit].rstrip()
+                + "..."
+            )
         tags = candidate.get("tags", [])
         if isinstance(tags, list):
             compact["tags"] = [
@@ -1164,6 +1487,12 @@ information to verify a narrative requirement.
             final_instructions = (
                 "Choose only relevant candidates that satisfy the "
                 "mandatory criteria as far as the supplied evidence allows. "
+                "Candidates are ordered by combined semantic and "
+                "catalog-tag relevance; prefer earlier candidates when "
+                "their plot evidence supports the request. Separate the "
+                "user's personal circumstances from the movie qualities "
+                "they ask for; do not recommend a film about a hardship "
+                "merely because the user mentioned that hardship. "
                 "When a taste profile is supplied, use it as a soft "
                 "personalization signal; explicit request criteria and "
                 "filters take priority. Rated movie examples and reviews "
@@ -1172,6 +1501,8 @@ information to verify a narrative requirement.
                 "relevance. "
                 "Use a candidate's plot_summary as the only source for plot "
                 "details; MovieLens tags are clues, not verified facts. "
+                "Use matching_search_terms only as weak retrieval signals; "
+                "they do not prove the movie's tone or plot. "
                 "For each recommendation, write a concise description in "
                 "the user's language using one or two short sentences: "
                 "briefly state the premise and connect it to the request "
@@ -1192,12 +1523,20 @@ information to verify a narrative requirement.
                 "if none is sufficiently relevant."
             )
 
+        prompt_candidates = self._rank_prompt_candidates(
+            list(candidates.values())
+        )[:self.MAX_PROMPT_CANDIDATES]
+        prompt_candidate_map = {
+            movie_id: candidate
+            for candidate in prompt_candidates
+            if (movie_id := self._get_movie_id(candidate)) is not None
+        }
         prompt = json.dumps(
             {
-                "recommendation_context": context.model_dump(mode="json"),
+                "recommendation_context": self._prompt_context_data(context),
                 "validated_catalog_candidates": [
-                    self._candidate_prompt_record(candidate)
-                    for candidate in candidates.values()
+                    self._final_candidate_prompt_record(candidate)
+                    for candidate in prompt_candidates
                 ],
                 "instructions": final_instructions,
             },
@@ -1220,7 +1559,7 @@ information to verify a narrative requirement.
 
             return self._render_validated_recommendations(
                 recommendations,
-                candidates,
+                prompt_candidate_map,
                 context,
             )
 
@@ -1330,6 +1669,31 @@ information to verify a narrative requirement.
         return response
 
 
+    @classmethod
+    def _final_candidate_prompt_record(cls, candidate: dict) -> dict:
+        """Send only the evidence needed to select and describe a movie."""
+
+        compact = {
+            key: candidate[key]
+            for key in ("movieId", "title", "genres")
+            if key in candidate
+        }
+        plot_summary = candidate.get("plot_summary")
+        if isinstance(plot_summary, str):
+            compact["plot_summary"] = plot_summary[
+                :cls.MAX_FINAL_PLOT_PROMPT_CHARACTERS
+            ].rstrip()
+            if len(plot_summary) > cls.MAX_FINAL_PLOT_PROMPT_CHARACTERS:
+                compact["plot_summary"] += "..."
+        matched_queries = candidate.get("matched_queries")
+        if isinstance(matched_queries, list):
+            compact["matching_search_terms"] = [
+                query
+                for query in matched_queries
+                if isinstance(query, str)
+            ]
+        return compact
+
     @staticmethod
     def _limit_to_two_sentences(text: Any) -> str:
         if not isinstance(text, str):
@@ -1429,6 +1793,7 @@ information to verify a narrative requirement.
 
         try:
             initial_candidates = self._initial_retrieval(context)
+            retrieved_candidate_count = len(initial_candidates)
             if self.synopsis_tool is not None:
                 initial_candidates = self.synopsis_tool.enrich_candidates(
                     initial_candidates
@@ -1456,6 +1821,12 @@ information to verify a narrative requirement.
             ]
 
         if not initial_candidates:
+            if not retrieved_candidate_count:
+                return (
+                    "Nu am găsit candidați potriviți în catalog pentru această "
+                    "cerere. Catalogul nu conține seriale, disponibilitate "
+                    "pe platforme sau informații verificate despre subtitrări."
+                )
             if (
                 self.synopsis_tool is not None
                 and self._requires_narrative_uncertainty(context)
@@ -1490,9 +1861,15 @@ information to verify a narrative requirement.
                 valid_candidates[movie_id] = dict(candidate)
         successful_tool_calls = 0
 
+        available_narrative_movie_ids = (
+            self._available_narrative_movie_ids(context)
+        )
         tool_call_budget = (
             self.MAX_TOOL_CALLS
-            if len(valid_candidates) < self.INITIAL_CANDIDATE_LIMIT
+            if (
+                len(valid_candidates) < self.INITIAL_CANDIDATE_LIMIT
+                and available_narrative_movie_ids is None
+            )
             else 0
         )
         for _ in range(tool_call_budget):

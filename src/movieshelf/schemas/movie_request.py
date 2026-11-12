@@ -61,6 +61,20 @@ class MovieRequest(BaseModel):
         description="Genres explicitly excluded."
     )
 
+    release_year_from: int | None = Field(
+        default=None,
+        ge=1870,
+        le=2100,
+        description="Earliest release year explicitly requested."
+    )
+
+    release_year_to: int | None = Field(
+        default=None,
+        ge=1870,
+        le=2100,
+        description="Latest release year explicitly requested."
+    )
+
     content_avoidances: list[Literal["gore", "jump scares"]] = Field(
         default_factory=list,
         description=(

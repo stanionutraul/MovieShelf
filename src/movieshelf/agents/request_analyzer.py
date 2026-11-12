@@ -38,6 +38,13 @@ Populate narrative_mechanisms when relevant.
 3. REQUIREMENTS AND PREFERENCES
 - required_criteria: explicit mandatory conditions.
 - preferred_criteria: desirable but non-mandatory qualities.
+- Every criterion must be supported by words or a clear synonym in the
+  user's request. Do not infer viewing conditions, runtime, effort level,
+  or story preferences from time of day or personal circumstances.
+- Treat time, snacks, and the viewing setup as context, not movie criteria.
+- A user's reason for wanting a movie is context, not a request for a movie
+  about that circumstance. For example, job stress does not imply a desire
+  to watch a movie about unemployment or illness.
 - genres_include and genres_exclude: explicit genre requests.
 - genres_match: use "any" by default for multiple included genres; use "all"
   only when the user explicitly requires every included genre.
@@ -136,6 +143,44 @@ CONTENT AVOIDANCES:
         r"\b(?:not necessarily|nu neapărat|nu neaparat)\b",
         re.IGNORECASE,
     )
+    CRITERION_STOP_WORDS = {
+        "a", "an", "and", "for", "in", "movie", "of", "or", "the",
+        "to", "vibe", "with",
+    }
+    CRITERION_CONTEXT_TERMS = {
+        "3am", "late", "night", "popcorn", "snack", "snacks", "watch",
+    }
+
+    @classmethod
+    def _criterion_is_supported(
+        cls,
+        criterion: str,
+        user_request: str,
+    ) -> bool:
+        criterion_terms = {
+            term
+            for term in re.findall(r"[a-z0-9]+", criterion.casefold())
+            if (
+                term not in cls.CRITERION_STOP_WORDS
+                and term not in cls.CRITERION_CONTEXT_TERMS
+            )
+        }
+        request_terms = set(
+            re.findall(r"[a-z0-9]+", user_request.casefold())
+        )
+        return any(
+            criterion_term in request_terms
+            or any(
+                len(criterion_term) >= 4
+                and len(request_term) >= 4
+                and (
+                    criterion_term.startswith(request_term)
+                    or request_term.startswith(criterion_term)
+                )
+                for request_term in request_terms
+            )
+            for criterion_term in criterion_terms
+        )
 
     def __init__(self, llm: MovieShelfLLM | None = None):
         self.llm = llm or MovieShelfLLM()
@@ -238,6 +283,42 @@ CONTENT AVOIDANCES:
 
         return avoidances
 
+    @staticmethod
+    def _explicit_release_year_range(
+        user_request: str,
+    ) -> tuple[int | None, int | None]:
+        decade_match = re.search(
+            r"\b(?:(18|19|20)?(\d{2})s)\b",
+            user_request,
+            re.IGNORECASE,
+        )
+        if decade_match:
+            century, decade = decade_match.groups()
+            decade_number = int(decade)
+            if century:
+                start = int(century) * 100 + decade_number
+            else:
+                start = (
+                    2000 + decade_number
+                    if decade_number < 30
+                    else 1900 + decade_number
+                )
+            return start, start + 9
+
+        range_match = re.search(
+            r"\b(?:between\s+)?((?:18|19|20)\d{2})"
+            r"\s*(?:-|–|—|to|through|and)\s*"
+            r"((?:18|19|20)\d{2})\b",
+            user_request,
+            re.IGNORECASE,
+        )
+        if range_match:
+            start, end = map(int, range_match.groups())
+            if start <= end:
+                return start, end
+
+        return None, None
+
     def analyze(self, user_request: str) -> MovieRequest:
         """Analyze a user's request and return structured data."""
 
@@ -255,6 +336,20 @@ CONTENT AVOIDANCES:
         )
 
         movie_request = MovieRequest.model_validate(result)
+        movie_request.required_criteria = [
+            criterion
+            for criterion in movie_request.required_criteria
+            if self._criterion_is_supported(criterion, user_request)
+        ]
+        movie_request.preferred_criteria = [
+            criterion
+            for criterion in movie_request.preferred_criteria
+            if self._criterion_is_supported(criterion, user_request)
+        ]
+        (
+            movie_request.release_year_from,
+            movie_request.release_year_to,
+        ) = self._explicit_release_year_range(user_request)
         movie_request.content_avoidances = (
             self._explicit_content_avoidances(user_request)
         )

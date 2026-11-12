@@ -8,6 +8,11 @@ from movieshelf.schemas.user_taste import UserTasteContext
 class RecommendationContext(BaseModel):
     """Temporary context for a single movie recommendation request."""
 
+    original_request: str | None = Field(
+        default=None,
+        description="The user's exact request text.",
+    )
+
     movie_request: MovieRequest | None = None
 
     taste_context: UserTasteContext | None = None

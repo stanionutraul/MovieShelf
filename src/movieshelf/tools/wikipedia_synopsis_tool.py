@@ -4,7 +4,7 @@ import re
 import ssl
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 import truststore
@@ -31,6 +31,7 @@ class WikipediaSynopsisTool:
         "(https://github.com/stanionutraul/MovieShelf)"
     )
     MAX_SUMMARY_CHARACTERS = 2000
+    MAX_PLOT_CHARACTERS = 12000
 
     def __init__(self, timeout: float = 10.0):
         if timeout <= 0:
@@ -58,6 +59,11 @@ class WikipediaSynopsisTool:
             return None
 
         return "tt" + digits.zfill(7)
+
+    @classmethod
+    def normalize_imdb_id(cls, value: Any) -> str | None:
+        """Normalize MovieLens IMDb identifier formats."""
+        return cls._normalize_imdb_id(value)
 
     def enrich_candidates(
         self,
@@ -154,7 +160,9 @@ class WikipediaSynopsisTool:
             ):
                 continue
 
-            page_title = article.path.removeprefix("/wiki/")
+            page_title = unquote(
+                article.path.removeprefix("/wiki/")
+            )
             if page_title:
                 articles[imdb_id] = (
                     item_match.group(1),
@@ -162,6 +170,139 @@ class WikipediaSynopsisTool:
                 )
 
         return articles
+
+    def find_wikipedia_articles(
+        self,
+        imdb_ids: set[str],
+    ) -> dict[str, tuple[str, str]]:
+        """Resolve IMDb IDs to English Wikipedia articles through Wikidata."""
+        return self._find_wikipedia_articles(imdb_ids)
+
+    def fetch_plot_section(
+        self,
+        wikidata_item: str,
+        page_title: str,
+    ) -> dict[str, Any] | None:
+        """Fetch a plot section with a verified page identity and license."""
+        params = urlencode({
+            "action": "query",
+            "format": "json",
+            "prop": "extracts|info|pageprops",
+            "inprop": "url",
+            "titles": page_title.replace("_", " "),
+            "explaintext": "1",
+            "exsectionformat": "wiki",
+            "redirects": "1",
+        })
+        payload = self._request_json(
+            "https://en.wikipedia.org/w/api.php?" + params,
+        )
+        pages = payload.get("query", {}).get("pages")
+        if not isinstance(pages, dict) or len(pages) != 1:
+            raise WikipediaSynopsisError(
+                f"Wikipedia returned an invalid page response for {page_title}."
+            )
+
+        page = next(iter(pages.values()))
+        if not isinstance(page, dict) or "missing" in page:
+            return None
+
+        pageprops = page.get("pageprops", {})
+        if (
+            not isinstance(pageprops, dict)
+            or pageprops.get("wikibase_item") != wikidata_item
+        ):
+            logger.info(
+                "Wikipedia page %s did not resolve to Wikidata item %s.",
+                page_title,
+                wikidata_item,
+            )
+            return None
+
+        extract = page.get("extract")
+        plot = (
+            self._extract_plot_section(extract)
+            if isinstance(extract, str)
+            else None
+        )
+        if not plot:
+            return None
+
+        title = page.get("title")
+        page_url = page.get("fullurl")
+        revision = page.get("lastrevid")
+        if (
+            not isinstance(title, str)
+            or not isinstance(page_url, str)
+            or not isinstance(revision, int)
+            or isinstance(revision, bool)
+        ):
+            raise WikipediaSynopsisError(
+                f"Wikipedia returned incomplete plot metadata for {page_title}."
+            )
+
+        parsed_page_url = urlparse(page_url)
+        if (
+            parsed_page_url.scheme != "https"
+            or parsed_page_url.netloc != "en.wikipedia.org"
+        ):
+            raise WikipediaSynopsisError(
+                f"Wikipedia returned an invalid source URL for {page_title}."
+            )
+
+        license_page = self._request_json(
+            self.WIKIPEDIA_PAGE_ENDPOINT
+            + quote(title, safe="()_'")
+        )
+        license_data = license_page.get("license", {})
+        license_url = license_data.get("url")
+        license_title = license_data.get("title")
+        parsed_license_url = (
+            urlparse(license_url)
+            if isinstance(license_url, str)
+            else None
+        )
+        if (
+            not isinstance(license_title, str)
+            or parsed_license_url is None
+            or parsed_license_url.netloc != "creativecommons.org"
+            or not parsed_license_url.path.startswith(
+                self.LICENSE_PATH_PREFIX
+            )
+        ):
+            logger.warning(
+                "Skipping Wikipedia page %s with unsupported license %s.",
+                title,
+                license_url,
+            )
+            return None
+
+        return {
+            "plot_summary": plot[:self.MAX_PLOT_CHARACTERS],
+            "narrative_source": {
+                "title": title,
+                "url": page_url,
+                "revision": revision,
+                "revision_url": f"{page_url}?oldid={revision}",
+                "license_title": license_title,
+                "license_url": license_url,
+            },
+        }
+
+    @staticmethod
+    def _extract_plot_section(extract: str) -> str | None:
+        heading = re.search(
+            r"(?im)^==\s*Plot\s*==\s*$",
+            extract,
+        )
+        if heading is None:
+            return None
+
+        remaining = extract[heading.end():]
+        next_section = re.search(r"(?m)^==[^=].*?==\s*$", remaining)
+        plot = remaining[:next_section.start()] if next_section else remaining
+        normalized = re.sub(r"\s+", " ", plot).strip()
+        return normalized or None
 
     def _load_synopsis(
         self,

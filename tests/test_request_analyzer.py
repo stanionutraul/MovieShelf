@@ -1,3 +1,4 @@
+from movieshelf.agents.context_builder import RecommendationContextBuilder
 from movieshelf.agents.request_analyzer import MovieRequestAnalyzer
 
 
@@ -78,6 +79,28 @@ def test_all_genre_mode_requires_explicit_all_language():
     assert request.genres_match == "any"
 
 
+def test_explicit_decade_is_extracted_as_hard_release_year_range():
+    analyzer = MovieRequestAnalyzer(llm=FakeLLM(_result()))
+
+    request = analyzer.analyze("Looking for funny movies from the 80s.")
+
+    assert request.release_year_from == 1980
+    assert request.release_year_to == 1989
+
+
+def test_explicit_four_digit_decade_and_year_range_are_extracted():
+    analyzer = MovieRequestAnalyzer(llm=FakeLLM(_result()))
+
+    decade = analyzer.analyze("Recommend a film from the 1980s.")
+    year_range = analyzer.analyze("Films released between 1990 and 1999.")
+
+    assert (decade.release_year_from, decade.release_year_to) == (1980, 1989)
+    assert (year_range.release_year_from, year_range.release_year_to) == (
+        1990,
+        1999,
+    )
+
+
 def test_moods_and_viewing_preferences_do_not_become_genre_filters():
     analyzer = MovieRequestAnalyzer(llm=FakeLLM(_result(
         genres_include=["Drama"],
@@ -91,6 +114,36 @@ def test_moods_and_viewing_preferences_do_not_become_genre_filters():
 
     assert request.genres_include == []
     assert request.genres_exclude == []
+
+
+def test_unsupported_viewing_effort_criteria_are_removed():
+    analyzer = MovieRequestAnalyzer(llm=FakeLLM(_result(
+        required_criteria=["new_movie"],
+        preferred_criteria=[
+            "cozy_vibe",
+            "popcorn_compatibility",
+            "no_active_mental_engagement",
+        ],
+    )))
+
+    request = analyzer.analyze(
+        "It's 3AM and I want a cozy movie that feels new and different."
+    )
+
+    assert request.required_criteria == ["new_movie"]
+    assert request.preferred_criteria == ["cozy_vibe"]
+
+
+def test_context_builder_preserves_the_original_user_request():
+    original_request = (
+        "It's 3AM and I want a cozy movie that feels new and different."
+    )
+    analyzer = MovieRequestAnalyzer(llm=FakeLLM(_result()))
+    context = RecommendationContextBuilder(analyzer=analyzer).build(
+        text=original_request,
+    )
+
+    assert context.original_request == original_request
 
 
 def test_explicit_animation_and_horror_exclusion_are_kept():

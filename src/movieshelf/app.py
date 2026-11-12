@@ -14,8 +14,9 @@ from movieshelf.letterboxd import (
     LetterboxdImportResult,
     load_letterboxd_export,
 )
+from movieshelf.semantic_search import SemanticMovieSearchEngine
 from movieshelf.tools.movie_catalog_tool import MovieCatalogTool
-from movieshelf.tools.wikipedia_synopsis_tool import WikipediaSynopsisTool
+from movieshelf.tools.wikipedia_plot_index import WikipediaPlotStore
 
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CATALOG_PATH = PROJECT_ROOT / "data" / "processed" / "movie_catalog_ranked.csv"
 TAGS_PATH = PROJECT_ROOT / "data" / "processed" / "movie_tags.csv"
 LINKS_PATH = PROJECT_ROOT / "data" / "raw" / "ml-32m"
+PROFILES_PATH = PROJECT_ROOT / "data" / "processed" / "movie_profiles.csv"
+PLOTS_PATH = PROJECT_ROOT / "data" / "processed" / "wikipedia_plots.sqlite"
 
 st.set_page_config(
     page_title="MovieShelf - find your next film",
@@ -42,10 +45,28 @@ def load_application_services() -> tuple[
         TAGS_PATH,
         links=load_links(LINKS_PATH),
     )
+    plot_store = WikipediaPlotStore(PLOTS_PATH)
+    profiles = plot_store.add_plots_to_profiles(
+        pd.read_csv(PROFILES_PATH)
+    )
+    available_plot_ids = plot_store.movie_ids_with_status("available")
+    profiles = profiles[
+        profiles["movieId"].isin(available_plot_ids)
+    ].reset_index(drop=True)
+    if profiles.empty:
+        raise RuntimeError(
+            "The local Wikipedia plot index has no licensed movie plots. "
+            "Run scripts\\import_wikipedia_plots.py before starting MovieShelf."
+        )
+    search_engine = SemanticMovieSearchEngine(
+        profiles,
+        movie_catalog=catalog.movies,
+    )
     context_builder = RecommendationContextBuilder()
     recommendation_agent = RecommendationAgent(
         catalog_tool=catalog,
-        synopsis_tool=WikipediaSynopsisTool(),
+        synopsis_tool=plot_store,
+        search_engine=search_engine,
     )
     return catalog, context_builder, recommendation_agent
 
@@ -377,8 +398,11 @@ def main() -> None:
     st.markdown("---")
     st.caption(
         "Your Letterboxd export is processed locally and is not saved by "
-        "MovieShelf. Recommendations use your local Ollama model; licensed "
-        "synopsis lookup may contact Wikidata and Wikipedia."
+        "MovieShelf. Recommendation analysis and semantic search run locally. "
+        "Stored Wikipedia plot sections include source and revision "
+        "attribution. The current "
+        "catalog covers movies only; it does not verify TV-series listings, "
+        "streaming availability, or subtitle options."
     )
 
 

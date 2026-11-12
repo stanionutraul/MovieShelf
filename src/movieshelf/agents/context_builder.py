@@ -26,6 +26,7 @@ class RecommendationContextBuilder:
             movie_request = self.analyzer.analyze(text)
 
         return RecommendationContext(
+            original_request=text.strip() if text else None,
             movie_request=movie_request,
             taste_context=taste_context,
             filters=filters or {},
