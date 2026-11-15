@@ -28,10 +28,19 @@ def _movie(
 
 
 class FakeCatalogTool:
-    def __init__(self, query_results=None, details=None, search_results=None):
+    def __init__(
+        self,
+        query_results=None,
+        details=None,
+        search_results=None,
+        catalog_tags=None,
+    ):
         self.query_results = query_results or {}
         self.details = details or {}
         self.search_results = search_results or []
+        self.tags = catalog_tags if catalog_tags is not None else pd.DataFrame(
+            columns=["movieId", "tag", "tag_count"]
+        )
         self.tag_queries = []
         self.tag_query_limits = []
         self.filter_calls = []
@@ -118,6 +127,7 @@ def _context(**request_values):
             "secret agency",
             "supernatural anomalies",
         ],
+        "requires_plot_evidence": True,
         "genres_include": ["science fiction"],
         "genres_exclude": ["horror"],
     }
@@ -167,6 +177,32 @@ def test_narrative_request_continues_without_a_qwen_tool_call():
         "get_movies_by_tags",
         "get_movie_details",
     ]
+
+def test_diagnostics_record_analysis_shortlist_and_final_selection():
+    candidate = _movie(10)
+    catalog = FakeCatalogTool({
+        "secret agency": [candidate],
+        "supernatural anomalies": [],
+    })
+    llm = FakeLLM([
+        _response(""),
+        _final_response(10),
+    ])
+    agent = RecommendationAgent(catalog_tool=catalog, llm=llm)
+    agent.collect_diagnostics = True
+
+    answer = agent.run(_context())
+
+    assert "Catalog Movie 10" in answer
+    assert agent.last_run_diagnostics["request_analysis"]["required_criteria"] == [
+        "secret agency",
+        "supernatural anomalies",
+    ]
+    assert [
+        candidate["movieId"]
+        for candidate in agent.last_run_diagnostics["initial_candidates"]
+    ] == [10]
+    assert agent.last_run_diagnostics["final_selected_movie_ids"] == [10]
 
 
 def test_full_initial_candidate_pool_skips_unneeded_tool_chat():
@@ -250,6 +286,29 @@ def test_narrative_candidate_selection_excludes_unindexed_tag_matches():
     )
 
     assert [candidate["movieId"] for candidate in candidates] == [2]
+
+
+def test_mood_and_genre_requests_do_not_require_imported_plot_records():
+    context = RecommendationContext(
+        movie_request=MovieRequest(
+            intent_summary="Find a cozy film.",
+            preferred_criteria=["cozy atmosphere"],
+        ),
+    )
+
+    assert not RecommendationAgent._requires_narrative_uncertainty(context)
+
+
+def test_explicit_plot_evidence_requests_remain_limited_to_verified_plots():
+    context = RecommendationContext(
+        movie_request=MovieRequest(
+            intent_summary="A story about a small-time bank robbery.",
+            required_criteria=["a small-time bank robbery"],
+            requires_plot_evidence=True,
+        ),
+    )
+
+    assert RecommendationAgent._requires_narrative_uncertainty(context)
 
 
 def test_taste_profile_is_included_as_a_personalization_signal():
@@ -393,7 +452,7 @@ def test_distinct_synthetic_profiles_give_model_distinct_rating_examples():
     assert musical_taste["rated_movie_examples"][0]["title"] == "Cats"
 
 
-def test_taste_genre_rating_does_not_override_tag_rank():
+def test_taste_genre_ratings_contribute_to_combined_candidate_rank():
     catalog = FakeCatalogTool({
         "thoughtful": [
             _movie(10, genres="Drama"),
@@ -436,12 +495,13 @@ def test_taste_genre_rating_does_not_override_tag_rank():
 
     assert [candidate["movieId"] for candidate in candidates] == [
         10,
-        11,
         12,
         13,
+        11,
     ]
     assert candidates[0]["taste_genre_match"]["average_rating"] == 4.8
-    assert candidates[-1]["taste_genre_match"]["average_rating"] == 1.5
+    assert candidates[1]["taste_genre_match"]["average_rating"] == 1.5
+    assert candidates[2]["taste_genre_match"]["average_rating"] == 1.5
 
 
 def test_personalization_scores_candidates_without_precomputed_relevance():
@@ -465,12 +525,215 @@ def test_personalization_scores_candidates_without_precomputed_relevance():
         },
     ]
 
-    ranked = RecommendationAgent._personalize_candidates(
+    agent = RecommendationAgent(
+        catalog_tool=FakeCatalogTool(),
+        llm=FakeLLM([]),
+    )
+    ranked = agent._personalize_candidates(
         candidates,
         taste,
     )
 
     assert [candidate["movieId"] for candidate in ranked] == [2, 1]
+
+
+def test_catalog_quality_softly_breaks_equal_relevance_ties():
+    candidates = [
+        {
+            **_movie(1, rating_count=1),
+            "weighted_rating": 3.54,
+            "request_relevance_score": 0.02,
+        },
+        {
+            **_movie(2, rating_count=50000),
+            "weighted_rating": 4.1,
+            "request_relevance_score": 0.02,
+        },
+    ]
+    agent = RecommendationAgent(
+        catalog_tool=FakeCatalogTool(),
+        llm=FakeLLM([]),
+    )
+
+    ranked = agent._personalize_candidates(candidates, None)
+
+    assert [candidate["movieId"] for candidate in ranked] == [2, 1]
+
+
+def test_request_and_letterboxd_taste_have_equal_rank_fusion_weight():
+    taste = UserTasteContext(
+        tag_rating_summary=[
+            {
+                "tag": "warm",
+                "average_rating": 4.8,
+                "rated_movie_count": 8,
+            },
+            {
+                "tag": "bleak",
+                "average_rating": 1.5,
+                "rated_movie_count": 6,
+            },
+        ],
+    )
+    candidates = [
+        {
+            **_movie(1),
+            "request_relevance_score": 0.03,
+        },
+        {
+            **_movie(2),
+            "request_relevance_score": 0.02,
+        },
+        {
+            **_movie(3),
+            "request_relevance_score": 0.01,
+        },
+    ]
+    catalog_tags = pd.DataFrame([
+        {"movieId": 1, "tag": "bleak", "tag_count": 2},
+        {"movieId": 2, "tag": "warm", "tag_count": 2},
+        {"movieId": 3, "tag": "warm", "tag_count": 2},
+    ])
+    agent = RecommendationAgent(
+        catalog_tool=FakeCatalogTool(catalog_tags=catalog_tags),
+        llm=FakeLLM([]),
+    )
+
+    ranked = agent._personalize_candidates(candidates, taste)
+
+    assert [candidate["movieId"] for candidate in ranked] == [2, 1, 3]
+    taste_scores = {
+        candidate["movieId"]: candidate["taste_match_score"]
+        for candidate in ranked
+    }
+    assert taste_scores[2] > taste_scores[1]
+
+
+def test_letterboxd_only_candidate_pool_excludes_watched_movies():
+    taste = UserTasteContext(
+        watched_movie_ids=[1],
+        tag_rating_summary=[
+            {
+                "tag": "warm",
+                "average_rating": 4.8,
+                "rated_movie_count": 3,
+            },
+        ],
+    )
+    catalog = FakeCatalogTool(
+        catalog_tags=pd.DataFrame([
+            {"movieId": 1, "tag": "warm", "tag_count": 3},
+            {"movieId": 2, "tag": "warm", "tag_count": 2},
+            {"movieId": 3, "tag": "unrelated", "tag_count": 2},
+        ]),
+    )
+    catalog.movies = pd.DataFrame([
+        _movie(1),
+        _movie(2),
+        _movie(3),
+    ])
+    agent = RecommendationAgent(catalog_tool=catalog, llm=FakeLLM([]))
+    context = RecommendationContext(taste_context=taste)
+
+    candidates = agent._letterboxd_candidate_pool(context)
+
+    assert [candidate["movieId"] for candidate in candidates] == [2]
+    assert candidates[0]["taste_tag_matches"] == ["warm"]
+
+
+def test_letterboxd_only_candidates_do_not_expand_a_text_retrieval_pool():
+    taste = UserTasteContext(
+        tag_rating_summary=[
+            {
+                "tag": "warm",
+                "average_rating": 4.8,
+                "rated_movie_count": 8,
+            },
+        ],
+    )
+    request_candidates = [
+        {
+            **_movie(movie_id),
+            "semantic_rank": rank,
+            "request_relevance_score": 1 / (60 + rank),
+        }
+        for rank, movie_id in enumerate(range(1, 10), start=1)
+    ]
+    taste_candidate = {
+        **_movie(20),
+        "taste_match_score": 4.8,
+        "taste_tag_matches": ["warm"],
+    }
+    catalog = FakeCatalogTool(
+        catalog_tags=pd.DataFrame([
+            {"movieId": 20, "tag": "warm", "tag_count": 2},
+        ]),
+    )
+    agent = RecommendationAgent(catalog_tool=catalog, llm=FakeLLM([]))
+    agent.collect_diagnostics = True
+
+    candidates = agent._select_balanced_candidates(
+        [],
+        RecommendationContext(
+            movie_request=MovieRequest(
+                intent_summary="A cozy and comforting movie.",
+                preferred_criteria=["cozy", "comforting"],
+            ),
+            taste_context=taste,
+        ),
+        seed_candidates=request_candidates,
+        taste_candidates=[taste_candidate],
+    )
+
+    assert 20 not in [candidate["movieId"] for candidate in candidates]
+    assert len(candidates) == agent.INITIAL_CANDIDATE_LIMIT
+    pool = agent.last_run_diagnostics["retrieval_pool"]
+    assert pool["request_candidate_count"] == 9
+    assert pool["letterboxd_candidate_count"] == 1
+    assert pool["letterboxd_only_candidate_count"] == 1
+
+
+def test_letterboxd_scores_do_not_boost_semantic_only_candidates():
+    taste = UserTasteContext(
+        tag_rating_summary=[
+            {
+                "tag": "warm",
+                "average_rating": 4.8,
+                "rated_movie_count": 8,
+            },
+        ],
+    )
+    candidate = _movie(1)
+    catalog = FakeCatalogTool(
+        catalog_tags=pd.DataFrame([
+            {"movieId": 1, "tag": "warm", "tag_count": 4},
+        ]),
+    )
+    agent = RecommendationAgent(catalog_tool=catalog, llm=FakeLLM([]))
+
+    selected = agent._select_balanced_candidates(
+        [],
+        RecommendationContext(
+            movie_request=MovieRequest(
+                intent_summary="A cozy and comforting movie.",
+                preferred_criteria=["cozy", "comforting"],
+            ),
+            taste_context=taste,
+        ),
+        seed_candidates=[{
+            **candidate,
+            "semantic_rank": 1,
+        }],
+        taste_candidates=[{
+            **candidate,
+            "taste_match_score": 4.8,
+            "taste_tag_matches": ["warm"],
+        }],
+    )
+
+    assert [movie["movieId"] for movie in selected] == [1]
+    assert "taste_match_score" not in selected[0]
+    assert "taste_tag_matches" not in selected[0]
 
 
 def test_multiple_tag_searches_prioritize_cross_query_matches():
@@ -592,6 +855,20 @@ def test_catalog_search_ignores_unavailable_metadata_and_unseen_wording():
     assert "subtitles" not in query
     assert "new" not in query
     assert "different" not in query
+
+
+def test_catalog_search_uses_both_intent_summary_and_preferences():
+    request = MovieRequest(
+        intent_summary="A warm, low-effort movie for a cozy evening.",
+        preferred_criteria=["lighthearted", "comforting"],
+    )
+
+    query = RecommendationAgent._catalog_search_query(request)
+
+    assert "warm" in query
+    assert "low-effort" in query
+    assert "lighthearted" in query
+    assert "comforting" in query
 
 
 def test_search_candidates_apply_hard_year_and_genre_constraints():
@@ -1142,13 +1419,16 @@ def test_final_prompt_stays_compact_and_preserves_request_and_taste():
     assert len(prompt_taste["rated_movie_examples"]) == 6
     assert len(prompt_taste["review_examples"]) == 3
     assert len(prompt_taste["review_examples"][0]["review"]) == 300
-    assert len(payload["validated_catalog_candidates"]) == 4
+    assert len(payload["validated_catalog_candidates"]) == 8
     assert all(
         len(candidate["plot_summary"]) <= 603
         for candidate in payload["validated_catalog_candidates"]
     )
     assert "tags" not in payload["validated_catalog_candidates"][0]
     assert "retrieval_score" not in payload["validated_catalog_candidates"][0]
+    assert payload["validated_catalog_candidates"][0]["average_rating"] == 4.0
+    assert payload["validated_catalog_candidates"][0]["rating_count"] == 100
+    assert "weighted_rating" in payload["validated_catalog_candidates"][0]
 
 
 def test_narrative_requests_stop_when_no_verified_synopsis_exists():
@@ -1168,6 +1448,36 @@ def test_narrative_requests_stop_when_no_verified_synopsis_exists():
     assert "sinopsis narativ verificabil" in result
     assert llm.messages == []
     assert llm.structured_prompts == []
+
+
+def test_general_request_without_synopsis_shows_catalog_evidence():
+    agent = RecommendationAgent(
+        catalog_tool=FakeCatalogTool(),
+        llm=FakeLLM([]),
+    )
+    movie = {
+        **_movie(10, title="Comfort Film (2020)", genres="Comedy|Romance"),
+        "average_rating": 4.2,
+        "rating_count": 1234,
+        "matched_queries": ["feel-good", "lighthearted"],
+        "taste_tag_matches": ["warm", "comforting"],
+    }
+
+    result = agent._render_sourced_recommendations(
+        [(movie, {"description": ""})],
+        RecommendationContext(
+            movie_request=MovieRequest(
+                intent_summary="A cozy, comforting movie.",
+            ),
+        ),
+    )
+
+    assert "**Comfort Film (2020)**" in result
+    assert "4.20/5 (1,234 evaluări)" in result
+    assert "Taguri asociate căutării: feel-good, lighthearted" in result
+    assert "preferințelor Letterboxd: warm, comforting" in result
+    assert "Sinopsisul verificat nu este disponibil" in result
+    assert "Nu este disponibil un sinopsis narativ licențiat" not in result
 
 
 def test_sourced_descriptions_are_limited_to_two_sentences():
@@ -1205,9 +1515,118 @@ def test_unranked_tool_results_are_not_recommended_outside_final_shortlist():
     assert catalog.search_calls == [{"query": "Tool Result Movie"}]
     final_prompt = json.loads(llm.structured_prompts[-1])
     transmitted_candidates = final_prompt["validated_catalog_candidates"]
-    assert len(transmitted_candidates) == agent.MAX_PROMPT_CANDIDATES
+    assert len(transmitted_candidates) == len(initial)
     transmitted_ids = [
         candidate["movieId"]
         for candidate in transmitted_candidates
     ]
     assert 20 not in transmitted_ids
+
+
+
+def test_semantic_candidates_must_pass_all_explicit_filters():
+    context = _context(
+        required_criteria=[],
+        preferred_criteria=[],
+        narrative_mechanisms=[],
+        genres_include=[],
+        genres_exclude=["Horror"],
+        exclude=["Catalog Movie 3"],
+    )
+    context.taste_context = UserTasteContext(watched_movie_ids=[1])
+    context.filters = {
+        "release_year_from": 2010,
+        "release_year_to": 2020,
+    }
+
+    invalid_title = _movie(6)
+    invalid_title["title"] = None
+
+    candidates = [
+        _movie(1),  # Already watched
+        _movie(2, genres="Horror|Mystery"),  # Excluded genre
+        _movie(3),  # Explicitly excluded title
+        _movie(4, title="Old Movie (2009)"),  # Outside year range
+        invalid_title,  # Invalid title
+        _movie(5, title="Valid Movie (2015)"),
+    ]
+
+    agent = RecommendationAgent(
+        catalog_tool=FakeCatalogTool(),
+        llm=FakeLLM([]),
+    )
+
+    selected = agent._select_balanced_candidates(
+        [],
+        context,
+        seed_candidates=candidates,
+    )
+
+    assert [candidate["movieId"] for candidate in selected] == [5]
+
+
+
+def test_semantic_candidates_are_validated_and_deduplicated():
+    movie = _movie(10, title="Valid Movie (2020)")
+
+    agent = RecommendationAgent(
+        catalog_tool=FakeCatalogTool(),
+        llm=FakeLLM([]),
+    )
+
+    selected = agent._select_balanced_candidates(
+        [("cozy", [movie])],
+        _context(),
+        seed_candidates=[
+            None,
+            "invalid record",
+            movie,
+        ],
+    )
+
+    assert [candidate["movieId"] for candidate in selected] == [10]
+    assert selected[0]["matched_queries"] == ["cozy"]
+
+
+
+def test_watched_semantic_candidates_cannot_reenter_through_tag_search():
+    watched_movie = _movie(10)
+    unseen_movie = _movie(20)
+
+    context = _context()
+    context.taste_context = UserTasteContext(watched_movie_ids=[10])
+
+    agent = RecommendationAgent(
+        catalog_tool=FakeCatalogTool(),
+        llm=FakeLLM([]),
+    )
+
+    selected = agent._select_balanced_candidates(
+        [("cozy", [watched_movie, unseen_movie])],
+        context,
+        seed_candidates=[watched_movie],
+    )
+
+    assert [candidate["movieId"] for candidate in selected] == [20]
+
+def test_tag_search_queries_include_viewing_experience():
+    request = MovieRequest(
+        intent_summary="A cozy and relaxing movie.",
+        viewing_experience={
+            "atmosphere": ["cozy", "comforting", "warm"],
+            "tone": ["lighthearted", "feel-good"],
+            "mental_effort": "low",
+        },
+    )
+
+    queries = RecommendationAgent._tag_search_queries(request)
+
+    for expected in (
+        "cozy",
+        "comforting",
+        "warm",
+        "lighthearted",
+        "feel-good",
+        "low mental effort",
+    ):
+        assert expected in queries

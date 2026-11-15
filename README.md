@@ -24,16 +24,32 @@ From the repository root in PowerShell:
 The app opens in a browser. Enter a movie request, optionally add filters, and
 choose **Find my next film**. For personalized recommendations, upload the ZIP
 created by Letterboxd's **Settings → Export**. The app does not require a
-Letterboxd account login and does not save the uploaded export.
+Letterboxd account login and does not save the uploaded export. When supplied,
+Letterboxd ratings and their MovieLens tags personalize discovery alongside
+the current request; movies already watched are excluded.
 
 The request analysis and recommendation model run through local Ollama.
-Recommendations use a local semantic index containing only movies with an
-available, verified Wikipedia plot. The index grows as plot data is imported;
-its first build may take several minutes depending on its size and hardware.
-Narrative evidence is read locally; recommendation prompts are not sent to
-Wikipedia. Catalog tag searches retain mood words from the original request,
-while the final model sees only the four highest-ranked candidates and cannot
-recommend a title outside that shortlist.
+Semantic discovery indexes the full MovieLens movie-profile catalog, not just
+the titles with imported Wikipedia plots. The initial embedding build covers
+about 87,000 movies and may take 20 minutes or more depending on hardware;
+subsequent starts reuse the local cache. Imported, attributed plots add
+narrative evidence where available. Only requests that require verified plot
+or character facts are limited to titles with those plots. Narrative evidence
+is read locally; recommendation prompts are not sent to Wikipedia. The final
+model sees up to eight highest-ranked candidates, including their community
+ratings and vote counts, and cannot recommend a title outside that shortlist.
+It may use established general knowledge only to assess a known film's
+subjective tone when no verified plot is available; it must not present
+unsourced plot details.
+For text requests, Letterboxd can reorder request-retrieved candidates only
+when they also have a direct request-tag match or match an explicitly
+included genre; profile-only matches and semantic-only candidates cannot
+receive a taste boost. Within that pool, request relevance and Letterboxd
+taste remain equally weighted, with confidence-adjusted community rating as
+a separate soft ranking signal.
+When a general mood request has no verified plot for a selected title, the
+app shows its catalog genres, rating evidence, and matching user tags instead
+of presenting an empty synopsis placeholder.
 
 ## Import licensed plot sections
 
@@ -58,11 +74,11 @@ other decades, import the entire catalog:
 .\.venv\Scripts\python.exe scripts\import_wikipedia_plots.py
 ```
 
-Import the plot data before starting MovieShelf. The app searches only titles
-with imported licensed plots, so a decade-only import limits recommendations
-to that decade. For general requests, import the entire catalog. Restart the
-app after an import so its local index and embedding cache include the new
-plots.
+Plot import is optional for general mood, genre, and style discovery. A
+decade-only import limits only requests requiring verified narrative evidence
+to that imported set. Import more years to broaden narrative matching. Restart
+the app after an import so its local index and embedding cache include new
+plot evidence.
 
 Retry titles that previously had no usable plot section with
 `--retry-unavailable`.
@@ -81,3 +97,6 @@ redistributing or using the project commercially.
 
 See [Letterboxd import details](docs/letterboxd-import.md) for matching
 behavior and profile limitations.
+
+See [recommendation benchmark](docs/recommendation-benchmark.md) for a
+reproducible local prompt/profile evaluation and its diagnostic output.

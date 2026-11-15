@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from movieshelf.schemas.user_taste import (
     GenreTasteSummary,
+    TagTasteSummary,
     TasteMovieRating,
     TasteReviewExample,
     UserTasteContext,
@@ -251,6 +252,7 @@ def _read_export_files(source: Path) -> dict[str, list[dict[str, str]]]:
 def load_letterboxd_export(
     source: str | Path,
     catalog: pd.DataFrame,
+    movie_tags: pd.DataFrame | None = None,
 ) -> LetterboxdImportResult:
     """Read an official Letterboxd CSV export and map entries to the catalog.
 
@@ -400,6 +402,50 @@ def load_letterboxd_export(
         for genre in genres_by_movie[entry["movie_id"]]:
             genre_ratings[genre].append(entry["rating"])
 
+    tag_ratings: dict[str, list[float]] = defaultdict(list)
+    if movie_tags is not None:
+        required_tag_columns = {"movieId", "tag"}
+        missing_tag_columns = required_tag_columns - set(movie_tags.columns)
+        if missing_tag_columns:
+            raise ValueError(
+                "Movie tags are missing required columns: "
+                + ", ".join(sorted(missing_tag_columns))
+            )
+        ratings_by_movie: dict[int, list[float]] = defaultdict(list)
+        for entry in rated_entries:
+            ratings_by_movie[entry["movie_id"]].append(entry["rating"])
+        rated_movie_ratings = {
+            movie_id: sum(ratings) / len(ratings)
+            for movie_id, ratings in ratings_by_movie.items()
+        }
+        rated_tags = movie_tags[
+            movie_tags["movieId"].isin(rated_movie_ratings)
+        ][["movieId", "tag"]].dropna().drop_duplicates()
+        for record in rated_tags.to_dict(orient="records"):
+            tag = record["tag"]
+            if not isinstance(tag, str) or not tag.strip():
+                continue
+            movie_id = int(record["movieId"])
+            tag_ratings[tag.strip()].append(
+                rated_movie_ratings[movie_id]
+            )
+
+    tag_rating_summary = [
+        TagTasteSummary(
+            tag=tag,
+            average_rating=sum(ratings) / len(ratings),
+            rated_movie_count=len(ratings),
+        )
+        for tag, ratings in sorted(
+            tag_ratings.items(),
+            key=lambda item: (
+                -len(item[1]),
+                item[0].casefold(),
+            ),
+        )
+        if len(ratings) >= 2
+    ]
+
     genre_averages = {
         genre: sum(ratings) / len(ratings)
         for genre, ratings in genre_ratings.items()
@@ -495,6 +541,7 @@ def load_letterboxd_export(
         review_examples=review_examples,
         rated_movie_examples=rated_movie_examples,
         genre_rating_summary=genre_rating_summary,
+        tag_rating_summary=tag_rating_summary,
         taste_summary=taste_summary,
     )
     return LetterboxdImportResult(

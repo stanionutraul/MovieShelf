@@ -4,6 +4,7 @@ import zipfile
 import pandas as pd
 
 from movieshelf.app import (
+    _build_search_profiles,
     build_recommendation_filters,
     load_letterboxd_upload,
 )
@@ -42,6 +43,32 @@ def test_recommendation_filters_leave_optional_filters_disabled_by_default():
         "release_year_from": 1900,
         "release_year_to": 2026,
     }
+
+
+def test_search_profiles_keep_movies_without_imported_plot():
+    class PartialPlotStore:
+        def add_plots_to_profiles(self, profiles):
+            return profiles.assign(
+                profile_text=profiles["profile_text"] + " enriched"
+            )
+
+        def movie_ids_with_status(self, status):
+            assert status == "available"
+            return {1}
+
+    profiles = pd.DataFrame({
+        "movieId": [1, 2, 3],
+        "profile_text": ["one", "two", "three"],
+    })
+
+    result = _build_search_profiles(profiles, PartialPlotStore())
+
+    assert result["movieId"].tolist() == [1, 2, 3]
+    assert result["profile_text"].tolist() == [
+        "one enriched",
+        "two enriched",
+        "three enriched",
+    ]
 
 
 def test_letterboxd_zip_upload_imports_without_persisting_upload_file(

@@ -46,18 +46,10 @@ def load_application_services() -> tuple[
         links=load_links(LINKS_PATH),
     )
     plot_store = WikipediaPlotStore(PLOTS_PATH)
-    profiles = plot_store.add_plots_to_profiles(
-        pd.read_csv(PROFILES_PATH)
+    profiles = _build_search_profiles(
+        pd.read_csv(PROFILES_PATH),
+        plot_store,
     )
-    available_plot_ids = plot_store.movie_ids_with_status("available")
-    profiles = profiles[
-        profiles["movieId"].isin(available_plot_ids)
-    ].reset_index(drop=True)
-    if profiles.empty:
-        raise RuntimeError(
-            "The local Wikipedia plot index has no licensed movie plots. "
-            "Run scripts\\import_wikipedia_plots.py before starting MovieShelf."
-        )
     search_engine = SemanticMovieSearchEngine(
         profiles,
         movie_catalog=catalog.movies,
@@ -71,9 +63,25 @@ def load_application_services() -> tuple[
     return catalog, context_builder, recommendation_agent
 
 
+def _build_search_profiles(
+    profiles: pd.DataFrame,
+    plot_store: WikipediaPlotStore,
+) -> pd.DataFrame:
+    """Keep the full MovieLens catalog searchable without requiring plots."""
+    enriched = plot_store.add_plots_to_profiles(profiles)
+    if enriched.empty:
+        raise RuntimeError(
+            "The local MovieLens movie-profile catalog is empty. "
+            "Regenerate data\\processed\\movie_profiles.csv before starting "
+            "MovieShelf."
+        )
+    return enriched.reset_index(drop=True)
+
+
 def load_letterboxd_upload(
     content: bytes,
     catalog: pd.DataFrame,
+    movie_tags: pd.DataFrame | None = None,
 ) -> LetterboxdImportResult:
     """Import an uploaded ZIP without retaining it after the request."""
     temporary_path: Path | None = None
@@ -86,7 +94,11 @@ def load_letterboxd_upload(
             temporary_file.write(content)
             temporary_path = Path(temporary_file.name)
 
-        return load_letterboxd_export(temporary_path, catalog)
+        return load_letterboxd_export(
+            temporary_path,
+            catalog,
+            movie_tags=movie_tags,
+        )
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
@@ -152,7 +164,11 @@ def _load_uploaded_letterboxd(
     st.session_state.pop("letterboxd_profile", None)
     st.session_state.pop("letterboxd_import_result", None)
     try:
-        result = load_letterboxd_upload(content, catalog.movies)
+        result = load_letterboxd_upload(
+            content,
+            catalog.movies,
+            catalog.tags,
+        )
     except (OSError, ValueError, zipfile.BadZipFile) as error:
         logger.exception("Could not import the uploaded Letterboxd export.")
         st.session_state["letterboxd_import_error"] = str(error)

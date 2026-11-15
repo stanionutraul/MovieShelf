@@ -234,6 +234,42 @@ def test_synthetic_exports_produce_distinct_taste_profiles(
     )
 
 
+def test_import_builds_tag_preferences_from_all_rated_movies(
+    tmp_path,
+    catalog,
+):
+    source = _write_export(
+        tmp_path / "tag-profile.zip",
+        {
+            "ratings.csv": (
+                "Date,Name,Year,Letterboxd URI,Rating\n"
+                "2024-01-01,Amelie,2001,"
+                "https://letterboxd.com/film/amelie/,5\n"
+                "2024-01-02,Portrait of a Lady on Fire,2019,"
+                "https://letterboxd.com/film/portrait/,4\n"
+                "2024-01-03,Cats,2019,"
+                "https://letterboxd.com/film/cats/,1\n"
+            ),
+        },
+    )
+    movie_tags = pd.DataFrame([
+        {"movieId": 1, "tag": "warm", "tag_count": 2},
+        {"movieId": 2, "tag": "warm", "tag_count": 1},
+        {"movieId": 3, "tag": "warm", "tag_count": 1},
+        {"movieId": 1, "tag": "romance", "tag_count": 1},
+    ])
+
+    result = load_letterboxd_export(source, catalog, movie_tags)
+
+    tag_preferences = {
+        item.tag: item
+        for item in result.taste_context.tag_rating_summary
+    }
+    assert tag_preferences["warm"].average_rating == 3.3333333333333335
+    assert tag_preferences["warm"].rated_movie_count == 3
+    assert "romance" not in tag_preferences
+
+
 def test_invalid_rating_is_reported_with_file_and_row(tmp_path, catalog):
     source = _write_export(
         tmp_path / "invalid.zip",

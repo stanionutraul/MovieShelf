@@ -38,6 +38,15 @@ Populate narrative_mechanisms when relevant.
 3. REQUIREMENTS AND PREFERENCES
 - required_criteria: explicit mandatory conditions.
 - preferred_criteria: desirable but non-mandatory qualities.
+- non_constraints: qualities or themes the user explicitly says are not
+  necessary. Do not turn these into preferences, requirements, or exclusions.
+- For example, "It doesn't have to be romantic or holiday-themed" means
+  neither romance nor holiday themes are required; it does not mean to
+  prefer or exclude them.
+- "Bonus points for subtitles" is an optional preference, not a requirement.
+- Set requires_plot_evidence only when matching requires verified facts
+  about plot, characters, or narrative events. Mood, genre, style, viewing
+  situation, and general emotional effect do not require plot evidence.
 - Every criterion must be supported by words or a clear synonym in the
   user's request. Do not infer viewing conditions, runtime, effort level,
   or story preferences from time of day or personal circumstances.
@@ -50,6 +59,26 @@ Populate narrative_mechanisms when relevant.
   only when the user explicitly requires every included genre.
 - Keep assumptions separate from explicit requirements.
 - Do not turn general viewing preferences into strict requirements.
+
+4. VIEWING EXPERIENCE
+- viewing_experience.atmosphere: explicit atmosphere qualities such as
+  cozy, warm, comforting, or whimsical.
+- viewing_experience.tone: explicit tone qualities such as lighthearted,
+  optimistic, uplifting, or feel-good.
+- viewing_experience.mental_effort: low, moderate, or high, only when
+  supported by the user's wording.
+- viewing_experience.emotional_intensity: low, moderate, or high, only
+  when explicitly supported. Do not infer it from atmosphere or tone.
+- viewing_experience.pacing: slow, moderate, or fast, only when explicitly
+  supported.
+- Keep atmosphere, tone, mental effort, emotional intensity, and pacing
+  separate. Do not infer one from another.
+- Do not infer low mental effort merely because a movie is described as
+  cozy or comforting.
+- Do not infer low emotional intensity merely because a movie is described
+  as lighthearted or feel-good.
+- Populate only qualities supported by the user's request. Leave other
+  fields empty or null.
 
 4. EXAMPLES
 - Only interpret movies explicitly mentioned by the user.
@@ -122,6 +151,37 @@ CONTENT AVOIDANCES:
         r"\b(?:no|not|avoid(?:ing)?|without|exclude|excluding|"
         r"don't want|do not want|not interested in|not looking for)\b"
     )
+    NON_CONSTRAINT_PATTERNS = (
+        re.compile(
+            r"\b(?:doesn['’]?t|does not|do not|don['’]?t) have to be\s+"
+            r"([^.!?;\n]+)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:doesn['’]?t|does not|do not|don['’]?t) need to be\s+"
+            r"([^.!?;\n]+)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\bnot necessarily(?: looking for| need(?:ed)? to be| be)?\s+"
+            r"([^.!?;\n]+)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:not required to be|need not be|is not a requirement|"
+            r"are not a requirement)\s+([^.!?;\n]+)",
+            re.IGNORECASE,
+        ),
+    )
+    OPTIONAL_PREFERENCE_PATTERN = re.compile(
+        r"\b(?:bonus points?|extra points?|would be (?:a )?(?:plus|bonus)|"
+        r"as a bonus|ideally|preferably|happy (?:to|with|watching)|open to)\b",
+        re.IGNORECASE,
+    )
+    NON_CONSTRAINT_FILLER_WORDS = {
+        "a", "an", "and", "any", "be", "genre", "genres", "kind",
+        "of", "or", "particular", "specific", "theme", "themes", "type",
+    }
     CONTENT_AVOIDANCE_ALIASES = {
         "gore": re.compile(
             r"\b(?:gore|graphic violence|violen(?:ce|ță) grafic(?:ă|a))\b",
@@ -182,6 +242,84 @@ CONTENT AVOIDANCES:
             for criterion_term in criterion_terms
         )
 
+    @classmethod
+    def _non_constraints(cls, user_request: str) -> list[str]:
+        phrases = []
+        seen = set()
+        for pattern in cls.NON_CONSTRAINT_PATTERNS:
+            for match in pattern.finditer(user_request):
+                for phrase in re.split(
+                    r",|\bor\b|\band\b",
+                    match.group(1),
+                    flags=re.IGNORECASE,
+                ):
+                    cleaned = " ".join(
+                        word
+                        for word in re.findall(
+                            r"[A-Za-z0-9'-]+",
+                            phrase,
+                        )
+                        if word.casefold()
+                        not in cls.NON_CONSTRAINT_FILLER_WORDS
+                    ).strip()
+                    normalized = cleaned.casefold()
+                    if cleaned and normalized not in seen:
+                        phrases.append(cleaned)
+                        seen.add(normalized)
+        return phrases
+
+    @classmethod
+    def _criterion_conflicts_with_non_constraint(
+        cls,
+        criterion: str,
+        non_constraints: list[str],
+    ) -> bool:
+        weak_terms = cls.NON_CONSTRAINT_FILLER_WORDS | {
+            "looking", "movie", "movies", "film", "films", "for",
+        }
+        criterion_terms = {
+            term
+            for term in re.findall(r"[a-z0-9]+", criterion.casefold())
+            if term not in weak_terms
+        }
+        non_constraint_terms = {
+            term
+            for phrase in non_constraints
+            for term in re.findall(r"[a-z0-9]+", phrase.casefold())
+            if term not in weak_terms
+        }
+        return bool(criterion_terms & non_constraint_terms)
+
+    @classmethod
+    def _criterion_is_optional(
+        cls,
+        criterion: str,
+        user_request: str,
+    ) -> bool:
+        criterion_terms = {
+            term
+            for term in re.findall(r"[a-z0-9]+", criterion.casefold())
+            if term not in cls.CRITERION_STOP_WORDS
+        }
+        for term in criterion_terms:
+            for match in re.finditer(
+                rf"\b{re.escape(term)}\b",
+                user_request,
+                re.IGNORECASE,
+            ):
+                sentence_start = max(
+                    user_request.rfind(mark, 0, match.start())
+                    for mark in ".!?;\n"
+                ) + 1
+                clause_prefix = re.split(
+                    r",|\b(?:and|but|however|although)\b",
+                    user_request[sentence_start:match.start()],
+                    flags=re.IGNORECASE,
+                )[-1]
+                if cls.OPTIONAL_PREFERENCE_PATTERN.search(clause_prefix):
+                    return True
+        return False
+
     def __init__(self, llm: MovieShelfLLM | None = None):
         self.llm = llm or MovieShelfLLM()
 
@@ -190,7 +328,7 @@ CONTENT AVOIDANCES:
         cls,
         user_request: str,
         genre: str,
-    ) -> list[tuple[int, bool]]:
+    ) -> list[tuple[int, bool, bool]]:
         """Return explicit genre mentions and whether each is negated."""
 
         aliases = cls.GENRE_ALIASES.get(genre)
@@ -215,9 +353,20 @@ CONTENT AVOIDANCES:
                     flags=re.IGNORECASE,
                 )
                 clause_prefix = clause_parts[-1]
+                optional = bool(
+                    re.search(
+                        r"\b(?:doesn['’]?t|does not|do not|don['’]?t) "
+                        r"(?:have to|need to) be\b|"
+                        r"\bnot necessarily\b|"
+                        r"\bnot required to be\b|\bneed not be\b",
+                        clause_prefix,
+                        re.IGNORECASE,
+                    )
+                )
                 mentions.append((
                     match.start(),
                     bool(cls.GENRE_NEGATION_PATTERN.search(clause_prefix)),
+                    optional,
                 ))
 
         return mentions
@@ -244,8 +393,9 @@ CONTENT AVOIDANCES:
 
             expected_negation = excluded
             if any(
-                is_negated == expected_negation
-                for _, is_negated in cls._genre_mentions(user_request, genre)
+                is_negated == expected_negation and not is_optional
+                for _, is_negated, is_optional
+                in cls._genre_mentions(user_request, genre)
             ):
                 retained.append(genre)
                 seen.add(normalized)
@@ -336,15 +486,26 @@ CONTENT AVOIDANCES:
         )
 
         movie_request = MovieRequest.model_validate(result)
+        non_constraints = self._non_constraints(user_request)
+        movie_request.non_constraints = non_constraints
         movie_request.required_criteria = [
             criterion
             for criterion in movie_request.required_criteria
             if self._criterion_is_supported(criterion, user_request)
+            and not self._criterion_is_optional(criterion, user_request)
+            and not self._criterion_conflicts_with_non_constraint(
+                criterion,
+                non_constraints,
+            )
         ]
         movie_request.preferred_criteria = [
             criterion
             for criterion in movie_request.preferred_criteria
             if self._criterion_is_supported(criterion, user_request)
+            and not self._criterion_conflicts_with_non_constraint(
+                criterion,
+                non_constraints,
+            )
         ]
         (
             movie_request.release_year_from,

@@ -36,6 +36,7 @@ catalog = MovieCatalogTool(
 profile = load_letterboxd_export(
     r"C:\path\to\letterboxd-export.zip",
     catalog.movies,
+    movie_tags=catalog.tags,
 ).taste_context
 context = RecommendationContextBuilder().build(
     text="Recommend a thoughtful film, but nothing too bleak.",
@@ -60,14 +61,28 @@ The profile also includes up to three highly rated and three low-rated titles
 with their catalog genres, so the model sees representative examples instead
 of opaque MovieLens IDs. These examples do not assert why a user rated a film
 and are passed as soft preferences, not as plot evidence.
-Mean ratings by genre include the number of matched ratings behind each
-average. Among candidates with equal breadth of match to the current request,
-the agent uses these genre averages only as a soft ordering tie-breaker.
+Mean ratings by genre and MovieLens tag include the number of rated films
+behind each average. Tags present on at least two rated films provide a richer
+taste signal than genre alone. The agent combines request relevance and
+Letterboxd taste with equally weighted reciprocal-rank fusion, then applies
+confidence-adjusted community rating as a separate soft ranking signal.
+This quality signal uses the catalog's weighted rating and vote count rather
+than a hard popularity cutoff, so lower-rated-confidence titles remain
+discoverable. Candidate discovery also includes films matching the user's
+rated tag preferences. The final model receives community rating evidence and
+candidate-specific Letterboxd tag matches when choosing from the shortlist.
 
-The profile is intended as a soft recommendation signal. Preferred genres can
-seed a profile-only search; less-preferred genres are not hard exclusions.
-Explicit request criteria and filters take priority, and movies already
-watched are excluded.
+The profile remains a preference signal, not a hard filter. Explicit request
+criteria and filters remain mandatory, and movies already watched are
+excluded. Profile-only requests can seed discovery from tags on highly rated
+films, falling back to preferred genres when tag history is insufficient.
+For requests that also contain text, profile-tag matches can personalize the
+ordering only after a movie has entered the request-retrieved candidate pool
+and has a direct request-tag match or matches an explicitly included genre.
+A profile-only match cannot introduce a new movie into that pool or boost a
+semantic-only match. This keeps personalization from replacing the current
+request, although semantic-only candidates can still be weak matches and are
+measured by the local recommendation benchmark.
 When used with the local Ollama integration, the compact profile and selected
 review excerpts are included in the local model context.
 

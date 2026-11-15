@@ -26,6 +26,14 @@ class GenreTasteSummary(BaseModel):
     rated_movie_count: int
 
 
+class TagTasteSummary(BaseModel):
+    """MovieLens tag preference inferred from all mapped user ratings."""
+
+    tag: str
+    average_rating: float
+    rated_movie_count: int
+
+
 class UserTasteContext(BaseModel):
     """Temporary representation of movie preferences inferred from Letterboxd data."""
 
@@ -75,6 +83,14 @@ class UserTasteContext(BaseModel):
         description=(
             "Mean Letterboxd ratings by catalog genre, with sample counts."
         )
+    )
+
+    tag_rating_summary: list[TagTasteSummary] = Field(
+        default_factory=list,
+        description=(
+            "Mean Letterboxd ratings for MovieLens tags on rated movies, "
+            "with sample counts."
+        ),
     )
 
     taste_summary: str | None = Field(

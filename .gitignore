@@ -33,4 +33,5 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-scripts/
+scripts/*
+!scripts/benchmark_recommendations.py

@@ -1,0 +1,247 @@
+[1mdiff --git a/src/movieshelf/agents/request_analyzer.py b/src/movieshelf/agents/request_analyzer.py[m
+[1mindex 1e28f94..35c7bee 100644[m
+[1m--- a/src/movieshelf/agents/request_analyzer.py[m
+[1m+++ b/src/movieshelf/agents/request_analyzer.py[m
+[36m@@ -38,6 +38,15 @@[m [mPopulate narrative_mechanisms when relevant.[m
+ 3. REQUIREMENTS AND PREFERENCES[m
+ - required_criteria: explicit mandatory conditions.[m
+ - preferred_criteria: desirable but non-mandatory qualities.[m
+[32m+[m[32m- non_constraints: qualities or themes the user explicitly says are not[m
+[32m+[m[32m  necessary. Do not turn these into preferences, requirements, or exclusions.[m
+[32m+[m[32m- For example, "It doesn't have to be romantic or holiday-themed" means[m
+[32m+[m[32m  neither romance nor holiday themes are required; it does not mean to[m
+[32m+[m[32m  prefer or exclude them.[m
+[32m+[m[32m- "Bonus points for subtitles" is an optional preference, not a requirement.[m
+[32m+[m[32m- Set requires_plot_evidence only when matching requires verified facts[m
+[32m+[m[32m  about plot, characters, or narrative events. Mood, genre, style, viewing[m
+[32m+[m[32m  situation, and general emotional effect do not require plot evidence.[m
+ - Every criterion must be supported by words or a clear synonym in the[m
+   user's request. Do not infer viewing conditions, runtime, effort level,[m
+   or story preferences from time of day or personal circumstances.[m
+[36m@@ -122,6 +131,37 @@[m [mCONTENT AVOIDANCES:[m
+         r"\b(?:no|not|avoid(?:ing)?|without|exclude|excluding|"[m
+         r"don't want|do not want|not interested in|not looking for)\b"[m
+     )[m
+[32m+[m[32m    NON_CONSTRAINT_PATTERNS = ([m
+[32m+[m[32m        re.compile([m
+[32m+[m[32m            r"\b(?:doesn['’]?t|does not|do not|don['’]?t) have to be\s+"[m
+[32m+[m[32m            r"([^.!?;\n]+)",[m
+[32m+[m[32m            re.IGNORECASE,[m
+[32m+[m[32m        ),[m
+[32m+[m[32m        re.compile([m
+[32m+[m[32m            r"\b(?:doesn['’]?t|does not|do not|don['’]?t) need to be\s+"[m
+[32m+[m[32m            r"([^.!?;\n]+)",[m
+[32m+[m[32m            re.IGNORECASE,[m
+[32m+[m[32m        ),[m
+[32m+[m[32m        re.compile([m
+[32m+[m[32m            r"\bnot necessarily(?: looking for| need(?:ed)? to be| be)?\s+"[m
+[32m+[m[32m            r"([^.!?;\n]+)",[m
+[32m+[m[32m            re.IGNORECASE,[m
+[32m+[m[32m        ),[m
+[32m+[m[32m        re.compile([m
+[32m+[m[32m            r"\b(?:not required to be|need not be|is not a requirement|"[m
+[32m+[m[32m            r"are not a requirement)\s+([^.!?;\n]+)",[m
+[32m+[m[32m            re.IGNORECASE,[m
+[32m+[m[32m        ),[m
+[32m+[m[32m    )[m
+[32m+[m[32m    OPTIONAL_PREFERENCE_PATTERN = re.compile([m
+[32m+[m[32m        r"\b(?:bonus points?|extra points?|would be (?:a )?(?:plus|bonus)|"[m
+[32m+[m[32m        r"as a bonus|ideally|preferably|happy (?:to|with|watching)|open to)\b",[m
+[32m+[m[32m        re.IGNORECASE,[m
+[32m+[m[32m    )[m
+[32m+[m[32m    NON_CONSTRAINT_FILLER_WORDS = {[m
+[32m+[m[32m        "a", "an", "and", "any", "be", "genre", "genres", "kind",[m
+[32m+[m[32m        "of", "or", "particular", "specific", "theme", "themes", "type",[m
+[32m+[m[32m    }[m
+     CONTENT_AVOIDANCE_ALIASES = {[m
+         "gore": re.compile([m
+             r"\b(?:gore|graphic violence|violen(?:ce|ță) grafic(?:ă|a))\b",[m
+[36m@@ -182,6 +222,84 @@[m [mCONTENT AVOIDANCES:[m
+             for criterion_term in criterion_terms[m
+         )[m
+ [m
+[32m+[m[32m    @classmethod[m
+[32m+[m[32m    def _non_constraints(cls, user_request: str) -> list[str]:[m
+[32m+[m[32m        phrases = [][m
+[32m+[m[32m        seen = set()[m
+[32m+[m[32m        for pattern in cls.NON_CONSTRAINT_PATTERNS:[m
+[32m+[m[32m            for match in pattern.finditer(user_request):[m
+[32m+[m[32m                for phrase in re.split([m
+[32m+[m[32m                    r",|\bor\b|\band\b",[m
+[32m+[m[32m                    match.group(1),[m
+[32m+[m[32m                    flags=re.IGNORECASE,[m
+[32m+[m[32m                ):[m
+[32m+[m[32m                    cleaned = " ".join([m
+[32m+[m[32m                        word[m
+[32m+[m[32m                        for word in re.findall([m
+[32m+[m[32m                            r"[A-Za-z0-9'-]+",[m
+[32m+[m[32m                            phrase,[m
+[32m+[m[32m                        )[m
+[32m+[m[32m                        if word.casefold()[m
+[32m+[m[32m                        not in cls.NON_CONSTRAINT_FILLER_WORDS[m
+[32m+[m[32m                    ).strip()[m
+[32m+[m[32m                    normalized = cleaned.casefold()[m
+[32m+[m[32m                    if cleaned and normalized not in seen:[m
+[32m+[m[32m                        phrases.append(cleaned)[m
+[32m+[m[32m                        seen.add(normalized)[m
+[32m+[m[32m        return phrases[m
+[32m+[m
+[32m+[m[32m    @classmethod[m
+[32m+[m[32m    def _criterion_conflicts_with_non_constraint([m
+[32m+[m[32m        cls,[m
+[32m+[m[32m        criterion: str,[m
+[32m+[m[32m        non_constraints: list[str],[m
+[32m+[m[32m    ) -> bool:[m
+[32m+[m[32m        weak_terms = cls.NON_CONSTRAINT_FILLER_WORDS | {[m
+[32m+[m[32m            "looking", "movie", "movies", "film", "films", "for",[m
+[32m+[m[32m        }[m
+[32m+[m[32m        criterion_terms = {[m
+[32m+[m[32m            term[m
+[32m+[m[32m            for term in re.findall(r"[a-z0-9]+", criterion.casefold())[m
+[32m+[m[32m            if term not in weak_terms[m
+[32m+[m[32m        }[m
+[32m+[m[32m        non_constraint_terms = {[m
+[32m+[m[32m            term[m
+[32m+[m[32m            for phrase in non_constraints[m
+[32m+[m[32m            for term in re.findall(r"[a-z0-9]+", phrase.casefold())[m
+[32m+[m[32m            if term not in weak_terms[m
+[32m+[m[32m        }[m
+[32m+[m[32m        return bool(criterion_terms & non_constraint_terms)[m
+[32m+[m
+[32m+[m[32m    @classmethod[m
+[32m+[m[32m    def _criterion_is_optional([m
+[32m+[m[32m        cls,[m
+[32m+[m[32m        criterion: str,[m
+[32m+[m[32m        user_request: str,[m
+[32m+[m[32m    ) -> bool:[m
+[32m+[m[32m        criterion_terms = {[m
+[32m+[m[32m            term[m
+[32m+[m[32m            for term in re.findall(r"[a-z0-9]+", criterion.casefold())[m
+[32m+[m[32m            if term not in cls.CRITERION_STOP_WORDS[m
+[32m+[m[32m        }[m
+[32m+[m[32m        for term in criterion_terms:[m
+[32m+[m[32m            for match in re.finditer([m
+[32m+[m[32m                rf"\b{re.escape(term)}\b",[m
+[32m+[m[32m                user_request,[m
+[32m+[m[32m                re.IGNORECASE,[m
+[32m+[m[32m            ):[m
+[32m+[m[32m                sentence_start = max([m
+[32m+[m[32m                    user_request.rfind(mark, 0, match.start())[m
+[32m+[m[32m                    for mark in ".!?;\n"[m
+[32m+[m[32m                ) + 1[m
+[32m+[m[32m                clause_prefix = re.split([m
+[32m+[m[32m                    r",|\b(?:and|but|however|although)\b",[m
+[32m+[m[32m                    user_request[sentence_start:match.start()],[m
+[32m+[m[32m                    flags=re.IGNORECASE,[m
+[32m+[m[32m                )[-1][m
+[32m+[m[32m                if cls.OPTIONAL_PREFERENCE_PATTERN.search(clause_prefix):[m
+[32m+[m[32m                    return True[m
+[32m+[m[32m        return False[m
+[32m+[m
+     def __init__(self, llm: MovieShelfLLM | None = None):[m
+         self.llm = llm or MovieShelfLLM()[m
+ [m
+[36m@@ -190,7 +308,7 @@[m [mCONTENT AVOIDANCES:[m
+         cls,[m
+         user_request: str,[m
+         genre: str,[m
+[31m-    ) -> list[tuple[int, bool]]:[m
+[32m+[m[32m    ) -> list[tuple[int, bool, bool]]:[m
+         """Return explicit genre mentions and whether each is negated."""[m
+ [m
+         aliases = cls.GENRE_ALIASES.get(genre)[m
+[36m@@ -215,9 +333,20 @@[m [mCONTENT AVOIDANCES:[m
+                     flags=re.IGNORECASE,[m
+                 )[m
+                 clause_prefix = clause_parts[-1][m
+[32m+[m[32m                optional = bool([m
+[32m+[m[32m                    re.search([m
+[32m+[m[32m                        r"\b(?:doesn['’]?t|does not|do not|don['’]?t) "[m
+[32m+[m[32m                        r"(?:have to|need to) be\b|"[m
+[32m+[m[32m                        r"\bnot necessarily\b|"[m
+[32m+[m[32m                        r"\bnot required to be\b|\bneed not be\b",[m
+[32m+[m[32m                        clause_prefix,[m
+[32m+[m[32m                        re.IGNORECASE,[m
+[32m+[m[32m                    )[m
+[32m+[m[32m                )[m
+                 mentions.append(([m
+                     match.start(),[m
+                     bool(cls.GENRE_NEGATION_PATTERN.search(clause_prefix)),[m
+[32m+[m[32m                    optional,[m
+                 ))[m
+ [m
+         return mentions[m
+[36m@@ -244,8 +373,9 @@[m [mCONTENT AVOIDANCES:[m
+ [m
+             expected_negation = excluded[m
+             if any([m
+[31m-                is_negated == expected_negation[m
+[31m-                for _, is_negated in cls._genre_mentions(user_request, genre)[m
+[32m+[m[32m                is_negated == expected_negation and not is_optional[m
+[32m+[m[32m                for _, is_negated, is_optional[m
+[32m+[m[32m                in cls._genre_mentions(user_request, genre)[m
+             ):[m
+                 retained.append(genre)[m
+                 seen.add(normalized)[m
+[36m@@ -336,15 +466,26 @@[m [mCONTENT AVOIDANCES:[m
+         )[m
+ [m
+         movie_request = MovieRequest.model_validate(result)[m
+[32m+[m[32m        non_constraints = self._non_constraints(user_request)[m
+[32m+[m[32m        movie_request.non_constraints = non_constraints[m
+         movie_request.required_criteria = [[m
+             criterion[m
+             for criterion in movie_request.required_criteria[m
+             if self._criterion_is_supported(criterion, user_request)[m
+[32m+[m[32m            and not self._criterion_is_optional(criterion, user_request)[m
+[32m+[m[32m            and not self._criterion_conflicts_with_non_constraint([m
+[32m+[m[32m                criterion,[m
+[32m+[m[32m                non_constraints,[m
+[32m+[m[32m            )[m
+         ][m
+         movie_request.preferred_criteria = [[m
+             criterion[m
+             for criterion in movie_request.preferred_criteria[m
+             if self._criterion_is_supported(criterion, user_request)[m
+[32m+[m[32m            and not self._criterion_conflicts_with_non_constraint([m
+[32m+[m[32m                criterion,[m
+[32m+[m[32m                non_constraints,[m
+[32m+[m[32m            )[m
+         ][m
+         ([m
+             movie_request.release_year_from,[m
+[1mdiff --git a/src/movieshelf/schemas/movie_request.py b/src/movieshelf/schemas/movie_request.py[m
+[1mindex 1feb8be..1d130da 100644[m
+[1m--- a/src/movieshelf/schemas/movie_request.py[m
+[1m+++ b/src/movieshelf/schemas/movie_request.py[m
+[36m@@ -33,6 +33,15 @@[m [mclass MovieRequest(BaseModel):[m
+         description="Relevant narrative techniques and mechanisms."[m
+     )[m
+ [m
+[32m+[m[32m    requires_plot_evidence: bool = Field([m
+[32m+[m[32m        default=False,[m
+[32m+[m[32m        description=([m
+[32m+[m[32m            "True when evaluating the request requires verified facts "[m
+[32m+[m[32m            "about a movie's plot, characters, or narrative events; false "[m
+[32m+[m[32m            "for genre, mood, style, or viewing-context preferences."[m
+[32m+[m[32m        ),[m
+[32m+[m[32m    )[m
+[32m+[m
+     required_criteria: list[str] = Field([m
+         default_factory=list,[m
+         description="Explicit mandatory conditions."[m
+[36m@@ -43,6 +52,14 @@[m [mclass MovieRequest(BaseModel):[m
+         description="Desirable but non-mandatory characteristics."[m
+     )[m
+ [m
+[32m+[m[32m    non_constraints: list[str] = Field([m
+[32m+[m[32m        default_factory=list,[m
+[32m+[m[32m        description=([m
+[32m+[m[32m            "Aspects the user explicitly says are not required. These are "[m
+[32m+[m[32m            "not preferences, exclusions, or search criteria."[m
+[32m+[m[32m        ),[m
+[32m+[m[32m    )[m
+[32m+[m
+     genres_include: list[str] = Field([m
+         default_factory=list,[m
+         description="Genres explicitly requested."[m

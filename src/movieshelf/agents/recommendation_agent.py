@@ -3,11 +3,13 @@ import json
 import logging
 import math
 import re
+from collections import defaultdict
 from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
 
 from movieshelf.llm import MovieShelfLLM
+from movieshelf.schemas import movie_request
 from movieshelf.schemas.recommendation_context import RecommendationContext
 from movieshelf.schemas.user_taste import UserTasteContext
 from movieshelf.tools.movie_catalog_tool import MovieCatalogTool
@@ -51,10 +53,11 @@ class RecommendationAgent:
     INITIAL_CANDIDATE_LIMIT = 8
     RETRIEVAL_CANDIDATE_LIMIT = 100
     TAG_SEARCH_RESULT_MULTIPLIER = 4
+    QUALITY_RANK_WEIGHT = 0.5
     MAX_TAGS_PER_CANDIDATE = 5
     MAX_PLOT_PROMPT_CHARACTERS = 1200
     MAX_FINAL_PLOT_PROMPT_CHARACTERS = 600
-    MAX_PROMPT_CANDIDATES = 4
+    MAX_PROMPT_CANDIDATES = 8
     MAX_TASTE_REVIEWS_IN_PROMPT = 3
     MAX_TASTE_REVIEW_CHARACTERS = 300
     TAG_QUERY_EXPANSIONS = (
@@ -128,6 +131,9 @@ class RecommendationAgent:
         "matched_queries",
         "retrieval_score",
         "request_relevance_score",
+        "personalized_rank_score",
+        "taste_match_score",
+        "taste_tag_matches",
         "plot_summary",
         "taste_genre_match",
     }
@@ -170,6 +176,8 @@ IMPORTANT RULES:
 10. Use the user's taste_summary, preferred_genres, and review_examples
     as preference signals, not as mandatory filters. The current request
     and its explicit filters take priority.
+    Treat non_constraints as aspects the user explicitly says are not
+    necessary; they are neither preferences nor exclusions.
 11. Separate the user's personal circumstances from the movie qualities
     they ask for. Do not treat hardship mentioned as context as a request
     for a movie about the same hardship.
@@ -218,6 +226,8 @@ information to verify a narrative requirement.
         self.llm = llm or MovieShelfLLM()
         self.synopsis_tool = synopsis_tool
         self.search_engine = search_engine
+        self.collect_diagnostics = False
+        self.last_run_diagnostics: dict[str, Any] = {}
 
         self.tool_functions = {
             "search_movies": self.catalog_tool.search_movies,
@@ -486,6 +496,7 @@ information to verify a narrative requirement.
                 movie_request,
                 context.original_request or "",
             )
+            taste_candidates = self._letterboxd_candidate_pool(context)
             query_results = []
             for query in queries:
                 matches = self.catalog_tool.get_movies_by_tags(
@@ -512,6 +523,7 @@ information to verify a narrative requirement.
                 query_results,
                 context,
                 seed_candidates=lexical_candidates,
+                taste_candidates=taste_candidates,
                 allowed_movie_ids=(
                     self._available_narrative_movie_ids(context)
                 ),
@@ -525,6 +537,9 @@ information to verify a narrative requirement.
                     or movie_request.required_criteria
                     or movie_request.preferred_criteria
                     or movie_request.examples_interpretation
+                    or movie_request.viewing_experience.atmosphere
+                    or movie_request.viewing_experience.tone
+                    or movie_request.viewing_experience.mental_effort
                 )
                 and (
                     movie_request.genres_include
@@ -534,9 +549,6 @@ information to verify a narrative requirement.
             ):
                 candidates = self._genre_filtered_catalog(context)
 
-        elif context.filters:
-            candidates = self._genre_filtered_catalog(context)
-
         elif movie_request and self.search_engine is not None:
             candidates = self._search_catalog_candidates(
                 movie_request,
@@ -544,17 +556,22 @@ information to verify a narrative requirement.
             )
 
         elif taste_context:
-            preferred_genres = taste_context.preferred_genres
-            if preferred_genres:
+            candidates = self._letterboxd_candidate_pool(context)
+            if not candidates and taste_context.preferred_genres:
                 candidates = self.catalog_tool.filter_movies(
-                    include_genres=preferred_genres,
+                    include_genres=taste_context.preferred_genres,
                     genre_match="any",
                     limit=self.INITIAL_CANDIDATE_LIMIT,
                 )
-            else:
+            elif not candidates and context.filters:
+                candidates = self._genre_filtered_catalog(context)
+            elif not candidates:
                 candidates = self.catalog_tool.get_random_movies(
                     limit=self.INITIAL_CANDIDATE_LIMIT
                 )
+
+        elif context.filters:
+            candidates = self._genre_filtered_catalog(context)
 
         else:
             candidates = []
@@ -585,11 +602,8 @@ information to verify a narrative requirement.
             and self._matches_explicit_filters(candidate, context)
         ]
 
-        candidates = candidates[:self.INITIAL_CANDIDATE_LIMIT]
-        return self._personalize_candidates(
-            candidates,
-            taste_context,
-        )
+        candidates = self._personalize_candidates(candidates, taste_context)
+        return candidates[:self.INITIAL_CANDIDATE_LIMIT]
 
     def _search_catalog_candidates(
         self,
@@ -606,6 +620,11 @@ information to verify a narrative requirement.
         results = self.search_engine.search(
             query,
             n=self.RETRIEVAL_CANDIDATE_LIMIT,
+        )
+        if "semantic_score" in results.columns:
+            results = results.sort_values(
+                by=["semantic_score", "movieId"],
+                ascending=[False, True],
         )
         movies = getattr(self.catalog_tool, "movies", None)
         if movies is None or not hasattr(movies, "to_dict"):
@@ -672,12 +691,11 @@ information to verify a narrative requirement.
             "subtitle", "subtitles", "tv",
         }
         phrases = [
+            movie_request.intent_summary,
             *movie_request.required_criteria,
             *movie_request.preferred_criteria,
             *movie_request.genres_include,
         ]
-        if not phrases:
-            phrases.append(movie_request.intent_summary)
         words = []
         seen = set()
         for phrase in phrases:
@@ -702,70 +720,364 @@ information to verify a narrative requirement.
         return " ".join(words[:32])
 
 
-    @classmethod
-    def _personalize_candidates(
-        cls,
+    def _letterboxd_taste_scores(
+        self,
         candidates: list[dict],
-        taste_context: UserTasteContext | None,
-    ) -> list[dict]:
-        """Use rated genre averages only to break ties in request relevance."""
+        taste_context: UserTasteContext,
+    ) -> dict[int, tuple[float, list[str]]]:
+        """Score candidates from rated MovieLens tags and genres."""
 
-        if not taste_context or not taste_context.genre_rating_summary:
-            return candidates
-
-        genre_ratings = {
+        tag_preferences = {
+            item.tag.casefold(): item
+            for item in taste_context.tag_rating_summary
+            if item.rated_movie_count >= 2
+        }
+        genre_preferences = {
             item.genre.casefold(): item
             for item in taste_context.genre_rating_summary
+            if item.rated_movie_count >= 2
         }
-        ranked_candidates = []
-        for index, candidate in enumerate(candidates):
+        movie_ids = {
+            movie_id
+            for candidate in candidates
+            if (movie_id := self._get_movie_id(candidate)) is not None
+        }
+        tag_scores: dict[int, tuple[float, list[str]]] = {}
+        catalog_tags = getattr(self.catalog_tool, "tags", None)
+        if (
+            tag_preferences
+            and catalog_tags is not None
+            and {"movieId", "tag"}.issubset(catalog_tags.columns)
+        ):
+            matched_tags = catalog_tags[
+                catalog_tags["movieId"].isin(movie_ids)
+            ].copy()
+            matched_tags["normalized_tag"] = (
+                matched_tags["tag"].astype(str).str.casefold()
+            )
+            matched_tags = matched_tags[
+                matched_tags["normalized_tag"].isin(tag_preferences)
+            ]
+            weights_by_movie: dict[int, float] = defaultdict(float)
+            weighted_ratings: dict[int, float] = defaultdict(float)
+            matched_by_movie: dict[int, list[str]] = defaultdict(list)
+            for record in matched_tags.to_dict(orient="records"):
+                movie_id = int(record["movieId"])
+                preference = tag_preferences[record["normalized_tag"]]
+                tag_count = record.get("tag_count", 1)
+                try:
+                    tag_weight = math.sqrt(max(float(tag_count), 1.0))
+                except (TypeError, ValueError):
+                    tag_weight = 1.0
+                weight = tag_weight * math.log1p(
+                    preference.rated_movie_count
+                )
+                weighted_ratings[movie_id] += (
+                    preference.average_rating * weight
+                )
+                weights_by_movie[movie_id] += weight
+                matched_by_movie[movie_id].append(
+                    str(record["tag"])
+                )
+            tag_scores = {
+                movie_id: (
+                    weighted_ratings[movie_id] / weights_by_movie[movie_id],
+                    sorted(
+                        set(matched_by_movie[movie_id]),
+                        key=lambda tag: (
+                            -tag_preferences[tag.casefold()].average_rating,
+                            tag.casefold(),
+                        ),
+                    )[:self.MAX_TAGS_PER_CANDIDATE],
+                )
+                for movie_id in weights_by_movie
+            }
+
+        scores = {}
+        for candidate in candidates:
+            movie_id = self._get_movie_id(candidate)
+            if movie_id is None:
+                continue
+            tag_match = tag_scores.get(movie_id)
             movie_genres = {
                 genre.strip().casefold()
                 for genre in str(candidate.get("genres", "")).split("|")
                 if genre.strip()
             }
-            matches = [
-                summary
-                for genre, summary in genre_ratings.items()
+            genre_matches = [
+                preference
+                for genre, preference in genre_preferences.items()
                 if genre in movie_genres
             ]
-            if matches:
+            genre_score = None
+            if genre_matches:
                 weights = [
-                    min(summary.rated_movie_count, 10)
-                    for summary in matches
+                    min(preference.rated_movie_count, 10)
+                    for preference in genre_matches
                 ]
-                score = sum(
-                    summary.average_rating * weight
-                    for summary, weight in zip(matches, weights)
+                genre_score = sum(
+                    preference.average_rating * weight
+                    for preference, weight in zip(genre_matches, weights)
                 ) / sum(weights)
                 candidate["taste_genre_match"] = {
-                    "average_rating": round(score, 3),
+                    "average_rating": round(genre_score, 3),
                     "matched_genres": [
                         {
-                            "genre": summary.genre,
+                            "genre": preference.genre,
                             "average_rating": round(
-                                summary.average_rating,
+                                preference.average_rating,
                                 3,
                             ),
-                            "rated_movie_count": summary.rated_movie_count,
+                            "rated_movie_count": preference.rated_movie_count,
                         }
-                        for summary in matches
+                        for preference in genre_matches
                     ],
                 }
+
+            if tag_match and genre_score is not None:
+                score = 0.75 * tag_match[0] + 0.25 * genre_score
+            elif tag_match:
+                score = tag_match[0]
+            elif genre_score is not None:
+                score = genre_score
+            else:
+                continue
+            scores[movie_id] = (score, tag_match[1] if tag_match else [])
+        return scores
+
+
+    def _letterboxd_candidate_pool(
+        self,
+        context: RecommendationContext,
+    ) -> list[dict]:
+        """Retrieve catalog candidates sharing tags on highly rated films."""
+
+        taste = context.taste_context
+        movies = getattr(self.catalog_tool, "movies", None)
+        catalog_tags = getattr(self.catalog_tool, "tags", None)
+        if (
+            taste is None
+            or not taste.tag_rating_summary
+            or movies is None
+            or catalog_tags is None
+            or not {"movieId", "tag"}.issubset(catalog_tags.columns)
+        ):
+            return []
+
+        preferences = {
+            item.tag.casefold(): item
+            for item in taste.tag_rating_summary
+            if item.rated_movie_count >= 2
+        }
+        if not preferences:
+            return []
+        matched_tags = catalog_tags[
+            catalog_tags["tag"].astype(str).str.casefold().isin(preferences)
+        ].copy()
+        if matched_tags.empty:
+            return []
+
+        score_by_movie: dict[int, float] = defaultdict(float)
+        weight_by_movie: dict[int, float] = defaultdict(float)
+        tags_by_movie: dict[int, list[str]] = defaultdict(list)
+        for record in matched_tags.to_dict(orient="records"):
+            movie_id = int(record["movieId"])
+            normalized_tag = str(record["tag"]).casefold()
+            preference = preferences[normalized_tag]
+            try:
+                tag_weight = math.sqrt(
+                    max(float(record.get("tag_count", 1)), 1.0)
+                )
+            except (TypeError, ValueError):
+                tag_weight = 1.0
+            weight = tag_weight * math.log1p(
+                preference.rated_movie_count
+            )
+            score_by_movie[movie_id] += preference.average_rating * weight
+            weight_by_movie[movie_id] += weight
+            tags_by_movie[movie_id].append(str(record["tag"]))
+
+        watched_ids = set(taste.watched_movie_ids)
+        catalog_records = movies.to_dict(orient="records")
+        candidates = []
+        for record in catalog_records:
+            movie_id = self._get_movie_id(record)
+            if (
+                movie_id not in score_by_movie
+                or movie_id in watched_ids
+                or not isinstance(record.get("title"), str)
+                or not self._matches_explicit_filters(record, context)
+            ):
+                continue
+            candidate = dict(record)
+            candidate["taste_match_score"] = (
+                score_by_movie[movie_id] / weight_by_movie[movie_id]
+            )
+            candidate["taste_tag_matches"] = sorted(
+                set(tags_by_movie[movie_id]),
+                key=str.casefold,
+            )[:self.MAX_TAGS_PER_CANDIDATE]
+            candidates.append(candidate)
+
+        candidates.sort(
+            key=lambda candidate: (
+                -candidate["taste_match_score"],
+                -float(candidate.get("weighted_rating", 0.0) or 0.0),
+                -int(candidate.get("rating_count", 0) or 0),
+                self._get_movie_id(candidate),
+            )
+        )
+        return candidates[:self.RETRIEVAL_CANDIDATE_LIMIT]
+
+
+    def _personalize_candidates(
+        self,
+        candidates: list[dict],
+        taste_context: UserTasteContext | None,
+        eligible_taste_movie_ids: set[int] | None = None,
+    ) -> list[dict]:
+        """Fuse request relevance and Letterboxd preference rankings."""
+
+        if not candidates:
+            return candidates
+        taste_scores = (
+            self._letterboxd_taste_scores(candidates, taste_context)
+            if taste_context
+            else {}
+        )
+        if eligible_taste_movie_ids is not None:
+            taste_scores = {
+                movie_id: score
+                for movie_id, score in taste_scores.items()
+                if movie_id in eligible_taste_movie_ids
+            }
+        request_scores = []
+        for index, candidate in enumerate(candidates):
             relevance_score = candidate.get("request_relevance_score")
             if relevance_score is None:
-                matched_queries = candidate.get("matched_queries", [])
                 relevance_score = sum(
-                    cls._query_specificity(query)
-                    for query in matched_queries
+                    self._query_specificity(query)
+                    for query in candidate.get("matched_queries", [])
                     if isinstance(query, str)
                 )
+            request_scores.append((index, float(relevance_score or 0.0)))
+
+        request_ranks = {}
+        previous_request_score = None
+        current_request_rank = 0
+        for position, (index, score) in enumerate(
+            sorted(request_scores, key=lambda item: (-item[1], item[0])),
+            start=1,
+        ):
+            if score != previous_request_score:
+                current_request_rank = position
+                previous_request_score = score
+            request_ranks[index] = current_request_rank
+        taste_score_by_index = {}
+        for index, candidate in enumerate(candidates):
+            movie_id = self._get_movie_id(candidate)
+            if movie_id is None:
+                continue
+            score = candidate.get("taste_match_score")
+            if (
+                eligible_taste_movie_ids is not None
+                and movie_id not in eligible_taste_movie_ids
+            ):
+                score = None
+            if score is None and movie_id in taste_scores:
+                score = taste_scores[movie_id][0]
+            if score is not None:
+                taste_score_by_index[index] = float(score)
+        taste_ranks = {}
+        previous_taste_score = None
+        current_taste_rank = 0
+        for position, (index, score) in enumerate(
+            sorted(
+                taste_score_by_index.items(),
+                key=lambda item: (-item[1], item[0]),
+            ),
+            start=1,
+        ):
+            if score != previous_taste_score:
+                current_taste_rank = position
+                previous_taste_score = score
+            taste_ranks[index] = current_taste_rank
+        quality_scores = {}
+        for index, candidate in enumerate(candidates):
+            weighted_rating = candidate.get("weighted_rating")
+            average_rating = candidate.get("average_rating")
+            rating_count = candidate.get("rating_count")
+            if (
+                isinstance(weighted_rating, (int, float))
+                and not isinstance(weighted_rating, bool)
+                and math.isfinite(weighted_rating)
+            ):
+                quality_rating = float(weighted_rating)
+            elif (
+                isinstance(average_rating, (int, float))
+                and not isinstance(average_rating, bool)
+                and math.isfinite(average_rating)
+            ):
+                quality_rating = float(average_rating)
+            else:
+                continue
+
+            if (
+                isinstance(rating_count, (int, float))
+                and not isinstance(rating_count, bool)
+                and math.isfinite(rating_count)
+                and rating_count >= 0
+            ):
+                count = float(rating_count)
+            else:
+                count = 0.0
+            quality_scores[index] = (quality_rating, count)
+        quality_ranks = {}
+        previous_quality = None
+        current_quality_rank = 0
+        for position, (index, quality) in enumerate(
+            sorted(
+                quality_scores.items(),
+                key=lambda item: (
+                    -item[1][0],
+                    -item[1][1],
+                    item[0],
+                ),
+            ),
+            start=1,
+        ):
+            if quality != previous_quality:
+                current_quality_rank = position
+                previous_quality = quality
+            quality_ranks[index] = current_quality_rank
+
+        ranked_candidates = []
+        for index, candidate in enumerate(candidates):
+            movie_id = self._get_movie_id(candidate)
+            taste_match = (
+                taste_scores.get(movie_id)
+                if movie_id is not None
+                else None
+            )
+            if taste_match is not None:
+                candidate["taste_match_score"] = round(
+                    taste_match[0],
+                    3,
+                )
+                if taste_match[1]:
+                    candidate["taste_tag_matches"] = taste_match[1]
+            combined_score = 1 / (60 + request_ranks[index])
+            if index in taste_ranks:
+                combined_score += 1 / (60 + taste_ranks[index])
+            if index in quality_ranks:
+                combined_score += (
+                    self.QUALITY_RANK_WEIGHT
+                    / (60 + quality_ranks[index])
+                )
+            candidate["personalized_rank_score"] = combined_score
             ranked_candidates.append((
-                -relevance_score,
-                -candidate.get(
-                    "taste_genre_match",
-                    {"average_rating": 2.5},
-                ).get("average_rating", -1.0),
+                -combined_score,
+                -request_scores[index][1],
                 index,
                 candidate,
             ))
@@ -779,16 +1091,20 @@ information to verify a narrative requirement.
         query_results: list[tuple[str, list[dict]]],
         context: RecommendationContext,
         seed_candidates: list[dict] | None = None,
+        taste_candidates: list[dict] | None = None,
         allowed_movie_ids: set[int] | None = None,
     ) -> list[dict]:
         """Rank full-text matches, with matching tags as additional evidence."""
 
+       
         candidates_by_id = {}
-        first_seen_order = {}
         for semantic_rank, record in enumerate(
             seed_candidates or [],
             start=1,
         ):
+            if not isinstance(record, dict):
+                continue
+
             movie_id = self._get_movie_id(record)
             if (
                 movie_id is None
@@ -796,12 +1112,23 @@ information to verify a narrative requirement.
                     allowed_movie_ids is not None
                     and movie_id not in allowed_movie_ids
                 )
+                or (
+                    context.taste_context
+                    and movie_id
+                    in context.taste_context.watched_movie_ids
+                )
+                or not isinstance(record.get("title"), str)
+                or not self._matches_explicit_filters(record, context)
             ):
                 continue
+
+            if movie_id in candidates_by_id:
+                continue
+
             candidate = dict(record)
             candidate["semantic_rank"] = semantic_rank
             candidates_by_id[movie_id] = candidate
-            first_seen_order[movie_id] = len(first_seen_order)
+
 
         for query, records in query_results:
             seen_in_query = set()
@@ -831,12 +1158,57 @@ information to verify a narrative requirement.
                 seen_in_query.add(movie_id)
                 if movie_id not in candidates_by_id:
                     candidates_by_id[movie_id] = dict(record)
-                    first_seen_order[movie_id] = len(first_seen_order)
                 candidate = candidates_by_id[movie_id]
                 matched_queries = candidate.setdefault("matched_queries", [])
                 if query not in matched_queries:
                     matched_queries.append(query)
                 candidate.setdefault("tag_ranks", {})[query] = tag_rank
+
+        for record in taste_candidates or []:
+            movie_id = self._get_movie_id(record)
+            request_candidate = candidates_by_id.get(movie_id)
+            request_genres = {
+                genre.casefold()
+                for genre in self._filter_genres(context, "genres_include")
+            }
+            candidate_genres = {
+                genre.strip().casefold()
+                for genre in str(
+                    request_candidate.get("genres", "")
+                    if request_candidate
+                    else ""
+                ).split("|")
+                if genre.strip()
+            }
+            has_request_evidence = bool(
+                request_candidate
+                and (
+                    request_candidate.get("matched_queries")
+                    or request_genres.intersection(candidate_genres)
+                )
+            )
+            if (
+                movie_id is None
+                or movie_id not in candidates_by_id
+                or not has_request_evidence
+                or (
+                    allowed_movie_ids is not None
+                    and movie_id not in allowed_movie_ids
+                )
+                or (
+                    context.taste_context
+                    and movie_id
+                    in context.taste_context.watched_movie_ids
+                )
+                or not isinstance(record.get("title"), str)
+                or not self._matches_explicit_filters(record, context)
+            ):
+                continue
+            candidates_by_id[movie_id].update({
+                key: record[key]
+                for key in ("taste_match_score", "taste_tag_matches")
+                if key in record
+            })
 
         for candidate in candidates_by_id.values():
             semantic_rank = candidate.get("semantic_rank")
@@ -853,16 +1225,63 @@ information to verify a narrative requirement.
                 semantic_score + tag_score
             )
 
-        selected_ids = sorted(
-            candidates_by_id,
-            key=lambda movie_id: (
-                -candidates_by_id[movie_id]["request_relevance_score"],
-                -len(candidates_by_id[movie_id].get("matched_queries", [])),
-                first_seen_order[movie_id],
-            ),
-        )[:self.INITIAL_CANDIDATE_LIMIT]
+        request_candidates = list(candidates_by_id.values())
+        if self.collect_diagnostics:
+            request_ids = {
+                self._get_movie_id(candidate)
+                for candidate in request_candidates
+            }
+            taste_ids = {
+                self._get_movie_id(candidate)
+                for candidate in taste_candidates or []
+                if self._get_movie_id(candidate) is not None
+            }
+            diagnostic_pool = sorted(
+                request_candidates,
+                key=lambda candidate: (
+                    -float(candidate.get("request_relevance_score", 0.0)),
+                    -float(candidate.get("taste_match_score", 0.0)),
+                    self._get_movie_id(candidate) or 0,
+                ),
+            )[:50]
+            self.last_run_diagnostics["retrieval_pool"] = {
+                "request_candidate_count": len(request_ids),
+                "letterboxd_candidate_count": len(taste_ids),
+                "letterboxd_only_candidate_count": len(
+                    taste_ids - request_ids
+                ),
+                "top_candidates": [
+                    self._diagnostic_candidate_record(candidate)
+                    for candidate in diagnostic_pool
+                ],
+            }
 
-        selected = [candidates_by_id[movie_id] for movie_id in selected_ids]
+        request_genres = {
+            genre.casefold()
+            for genre in self._filter_genres(context, "genres_include")
+        }
+        eligible_taste_movie_ids = {
+            movie_id
+            for candidate in request_candidates
+            if (
+                (movie_id := self._get_movie_id(candidate)) is not None
+                and (
+                    candidate.get("matched_queries")
+                    or request_genres.intersection({
+                        genre.strip().casefold()
+                        for genre in str(
+                            candidate.get("genres", "")
+                        ).split("|")
+                        if genre.strip()
+                    })
+                )
+            )
+        }
+        selected = self._personalize_candidates(
+            request_candidates,
+            context.taste_context,
+            eligible_taste_movie_ids=eligible_taste_movie_ids,
+        )[:self.INITIAL_CANDIDATE_LIMIT]
         self._attach_candidate_tags(selected)
         return selected
 
@@ -887,6 +1306,11 @@ information to verify a narrative requirement.
 
             tag_rows = details.get("tags", [])
             queries = candidate.get("matched_queries", [])
+            taste_tags = {
+                tag.casefold()
+                for tag in candidate.get("taste_tag_matches", [])
+                if isinstance(tag, str)
+            }
             relevant_tags = []
 
             for tag_row in tag_rows:
@@ -897,7 +1321,14 @@ information to verify a narrative requirement.
                 if not isinstance(tag, str):
                     continue
 
-                if any(query.casefold() in tag.casefold() for query in queries):
+                if (
+                    any(
+                        isinstance(query, str)
+                        and query.casefold() in tag.casefold()
+                        for query in queries
+                    )
+                    or tag.casefold() in taste_tags
+                ):
                     relevant_tags.append({
                         "tag": tag,
                         "tag_count": tag_row.get("tag_count"),
@@ -961,11 +1392,34 @@ information to verify a narrative requirement.
     ) -> list[str]:
         """Extract a few focused tag queries from the structured request."""
 
+        viewing_experience = movie_request.viewing_experience
+
+        experience_phrases = [
+            *viewing_experience.atmosphere,
+            *viewing_experience.tone,
+        ]
+
+        if viewing_experience.mental_effort:
+            experience_phrases.append(
+                f"{viewing_experience.mental_effort} mental effort"
+            )
+
+        if viewing_experience.emotional_intensity:
+            experience_phrases.append(
+                f"{viewing_experience.emotional_intensity} emotional intensity"
+            )
+
+        if viewing_experience.pacing:
+            experience_phrases.append(
+                f"{viewing_experience.pacing} pacing"
+            )
+
         supporting_text = " ".join([
             movie_request.intent_summary,
             original_request,
             *movie_request.required_criteria,
             *movie_request.preferred_criteria,
+            *experience_phrases,
         ])
         phrases = [
             *(
@@ -981,6 +1435,7 @@ information to verify a narrative requirement.
             ),
             *movie_request.required_criteria,
             *movie_request.preferred_criteria,
+            *experience_phrases,
             *(
                 mechanism
                 for example in movie_request.examples_interpretation
@@ -1252,10 +1707,12 @@ information to verify a narrative requirement.
         return bool(
             request
             and (
-                request.narrative_mechanisms
-                or request.required_criteria
-                or request.preferred_criteria
-                or request.examples_interpretation
+                request.requires_plot_evidence
+                or request.narrative_mechanisms
+                or any(
+                    example.relevant_mechanisms
+                    for example in request.examples_interpretation
+                )
             )
         )
 
@@ -1284,15 +1741,19 @@ information to verify a narrative requirement.
             "catalog_evidence_note": (
                 "MovieLens tags are user-contributed clues, not verified "
                 "plot descriptions. When present, plot_summary is the "
-                "attributed plot section for the exact IMDb-linked title."
+                "attributed plot section for the exact IMDb-linked title. "
+                "taste_tag_matches are Letterboxd preference signals, "
+                "not plot facts."
             ),
             "instructions": (
                 "The recommendation_context contains the user's complete "
                 "request. Evaluate only the supplied catalog candidates "
-                "against mandatory criteria and preferences. Candidates with "
-                "higher request_relevance_score have stronger full-text or "
-                "tag evidence for the request. Do not select candidates just "
-                "because of a weak, incidental tag match. Python has "
+                "against mandatory criteria and preferences. Python ranks "
+                "candidates by combining request relevance and Letterboxd "
+                "taste as equally weighted signals; the supplied order "
+                "reflects that combined ranking. Do not override that "
+                "ranking without strong evidence. Do not select candidates "
+                "just because of a weak, incidental tag match. Python has "
                 "already performed the initial searches and verifiable "
                 "filters; tool calls are optional for additional data. "
                 "When a taste profile is present, use it to personalize "
@@ -1350,6 +1811,10 @@ information to verify a narrative requirement.
             ]
             if isinstance(review, dict)
         ]
+        taste["tag_rating_summary"] = taste.get(
+            "tag_rating_summary",
+            [],
+        )[:30]
         return data
 
     @staticmethod
@@ -1363,8 +1828,11 @@ information to verify a narrative requirement.
             key=lambda candidate: (
                 -float(
                     candidate.get(
-                        "request_relevance_score",
-                        candidate.get("retrieval_score", 0.0),
+                        "personalized_rank_score",
+                        candidate.get(
+                            "request_relevance_score",
+                            candidate.get("retrieval_score", 0.0),
+                        ),
                     )
                     or 0.0
                 ),
@@ -1411,8 +1879,20 @@ information to verify a narrative requirement.
                 for tag in tags[:cls.MAX_TAGS_PER_CANDIDATE]
                 if isinstance(tag, dict)
             ]
+        taste_tags = compact.get("taste_tag_matches")
+        if isinstance(taste_tags, list):
+            compact["taste_tag_matches"] = taste_tags[
+                :cls.MAX_TAGS_PER_CANDIDATE
+            ]
         return compact
 
+    @classmethod
+    def _diagnostic_candidate_record(cls, candidate: dict) -> dict:
+        record = cls._candidate_prompt_record(candidate)
+        for field in ("semantic_rank", "semantic_score", "tag_ranks"):
+            if field in candidate:
+                record[field] = candidate[field]
+        return record
 
     def _execute_tool(
         self,
@@ -1487,8 +1967,14 @@ information to verify a narrative requirement.
             final_instructions = (
                 "Choose only relevant candidates that satisfy the "
                 "mandatory criteria as far as the supplied evidence allows. "
-                "Candidates are ordered by combined semantic and "
-                "catalog-tag relevance; prefer earlier candidates when "
+                "Treat non_constraints as neither requirements nor "
+                "Use viewing_experience atmosphere and tone as explicit "
+                "soft relevance signals. Consider mental effort, emotional "
+                "intensity, and pacing only when specified. Keep these "
+                "dimensions separate and do not infer one from another. "
+                "preferences. "
+                "Candidates are ordered by combined request and "
+                "Letterboxd preference relevance; prefer earlier candidates when "
                 "their plot evidence supports the request. Separate the "
                 "user's personal circumstances from the movie qualities "
                 "they ask for; do not recommend a film about a hardship "
@@ -1498,17 +1984,25 @@ information to verify a narrative requirement.
                 "filters take priority. Rated movie examples and reviews "
                 "are taste signals only, not plot evidence. Use "
                 "taste_genre_match only as a tie-breaker after request "
-                "relevance. "
+                "relevance. Consider average_rating, rating_count, and "
+                "weighted_rating as a separate confidence and quality "
+                "signal; do not treat a high rating as proof of mood fit. "
+                "Keep request relevance and Letterboxd preference equally "
+                "important. "
                 "Use a candidate's plot_summary as the only source for plot "
                 "details; MovieLens tags are clues, not verified facts. "
                 "Use matching_search_terms only as weak retrieval signals; "
                 "they do not prove the movie's tone or plot. "
-                "For each recommendation, write a concise description in "
-                "the user's language using one or two short sentences: "
-                "briefly state the premise and connect it to the request "
-                "only when the synopsis supports that connection. Avoid "
-                "spoilers. Do not invent plot details or repeat long source "
-                "passages. Return only movieId and description fields. "
+                "When a verified plot_summary exists, write a concise "
+                "description in the user's language using one or two short "
+                "sentences and connect it to the request only when the "
+                "synopsis supports that connection. When no verified plot "
+                "exists, you may use well-established general knowledge "
+                "about a known film only to judge subjective tone or mood "
+                "fit; do not invent or state plot facts, and abstain when "
+                "uncertain. Select no more than four recommendations. Avoid "
+                "spoilers and long source passages. Return only movieId and "
+                "description fields. "
                 "Return no recommendations if none is sufficiently relevant."
             )
         else:
@@ -1606,6 +2100,12 @@ information to verify a narrative requirement.
             valid.append((movie, recommendation))
             seen_ids.add(movie_id)
 
+        if self.collect_diagnostics:
+            self.last_run_diagnostics["final_selected_movie_ids"] = [
+                self._get_movie_id(movie)
+                for movie, _ in valid
+            ]
+
         if not valid:
             return (
                 "Nu am putut valida nicio recomandare care să respecte "
@@ -1675,7 +2175,17 @@ information to verify a narrative requirement.
 
         compact = {
             key: candidate[key]
-            for key in ("movieId", "title", "genres")
+            for key in (
+                "movieId",
+                "title",
+                "genres",
+                "average_rating",
+                "rating_count",
+                "weighted_rating",
+                "taste_match_score",
+                "taste_tag_matches",
+                "taste_genre_match",
+            )
             if key in candidate
         }
         plot_summary = candidate.get("plot_summary")
@@ -1724,6 +2234,7 @@ information to verify a narrative requirement.
         context: RecommendationContext,
     ) -> str:
         rendered = []
+        missing_synopsis = False
         for movie, recommendation in recommendations:
             source = movie.get("narrative_source")
             summary = movie.get("plot_summary")
@@ -1734,10 +2245,54 @@ information to verify a narrative requirement.
             ):
                 if self._requires_narrative_uncertainty(context):
                     continue
-                rendered.append(
-                    f"**{movie['title']}** — Nu este disponibil un "
-                    "sinopsis narativ licențiat și verificabil."
-                )
+                missing_synopsis = True
+                details = [f"**{movie['title']}**"]
+                genres = movie.get("genres")
+                if isinstance(genres, str) and genres.strip():
+                    details.append(f"- Genuri din catalog: {genres}.")
+
+                average_rating = movie.get("average_rating")
+                rating_count = movie.get("rating_count")
+                if (
+                    isinstance(average_rating, (int, float))
+                    and not isinstance(average_rating, bool)
+                    and math.isfinite(average_rating)
+                    and isinstance(rating_count, (int, float))
+                    and not isinstance(rating_count, bool)
+                    and math.isfinite(rating_count)
+                ):
+                    details.append(
+                        "- Rating MovieLens: "
+                        f"{average_rating:.2f}/5 "
+                        f"({int(rating_count):,} evaluări)."
+                    )
+
+                request_tags = movie.get("matched_queries", [])
+                if isinstance(request_tags, list) and request_tags:
+                    details.append(
+                        "- Taguri asociate căutării: "
+                        + ", ".join(
+                            str(tag)
+                            for tag in request_tags[
+                                :self.MAX_TAGS_PER_CANDIDATE
+                            ]
+                        )
+                        + "."
+                    )
+
+                taste_tags = movie.get("taste_tag_matches", [])
+                if isinstance(taste_tags, list) and taste_tags:
+                    details.append(
+                        "- Taguri asociate preferințelor Letterboxd: "
+                        + ", ".join(
+                            str(tag)
+                            for tag in taste_tags[
+                                :self.MAX_TAGS_PER_CANDIDATE
+                            ]
+                        )
+                        + "."
+                    )
+                rendered.append("\n".join(details))
                 continue
 
             description = self._limit_to_two_sentences(
@@ -1772,7 +2327,15 @@ information to verify a narrative requirement.
                 "și descriere validată."
             )
 
-        return "\n\n".join(rendered)
+        response = "\n\n".join(rendered)
+        if missing_synopsis:
+            response += (
+                "\n\n*Sinopsisul verificat nu este disponibil pentru toate "
+                "titlurile. Tagurile MovieLens sunt indicii furnizate de "
+                "utilizatori, nu confirmări ale intrigii; disponibilitatea "
+                "pe platforme nu este verificată.*"
+            )
+        return response
 
 
     def run(
@@ -1780,6 +2343,31 @@ information to verify a narrative requirement.
         context: RecommendationContext,
     ) -> str:
         """Run one independent movie recommendation request."""
+
+        if self.collect_diagnostics:
+            taste = context.taste_context
+            self.last_run_diagnostics = {
+                "original_request": context.original_request,
+                "request_analysis": (
+                    context.movie_request.model_dump(mode="json")
+                    if context.movie_request
+                    else None
+                ),
+                "explicit_filters": context.filters,
+                "profile_summary": (
+                    {
+                        "watched_movie_count": len(taste.watched_movie_ids),
+                        "rated_movie_example_count": len(
+                            taste.rated_movie_examples
+                        ),
+                        "review_example_count": len(taste.review_examples),
+                        "preferred_genres": taste.preferred_genres,
+                    }
+                    if taste
+                    else None
+                ),
+                "final_selected_movie_ids": [],
+            }
 
         request = context.movie_request
         if request and request.content_avoidances:
@@ -1818,6 +2406,12 @@ information to verify a narrative requirement.
                     and candidate["plot_summary"].strip()
                     and isinstance(candidate.get("narrative_source"), dict)
                 )
+            ]
+
+        if self.collect_diagnostics:
+            self.last_run_diagnostics["initial_candidates"] = [
+                self._diagnostic_candidate_record(candidate)
+                for candidate in initial_candidates
             ]
 
         if not initial_candidates:
@@ -1859,6 +2453,7 @@ information to verify a narrative requirement.
             movie_id = self._get_movie_id(candidate)
             if movie_id is not None:
                 valid_candidates[movie_id] = dict(candidate)
+        initial_candidate_ids = set(valid_candidates)
         successful_tool_calls = 0
 
         available_narrative_movie_ids = (
@@ -2047,6 +2642,12 @@ information to verify a narrative requirement.
                     )
                 }
 
+        valid_candidates = {
+            movie_id: candidate
+            for movie_id, candidate in valid_candidates.items()
+            if movie_id in initial_candidate_ids
+        }
+
         logger.info(
             "Recommendation completed. Initial candidates: %s, "
             "successful additional tool calls: %s",
@@ -2054,7 +2655,12 @@ information to verify a narrative requirement.
             successful_tool_calls,
         )
 
-        return self._generate_final_answer(
+        answer = self._generate_final_answer(
             context,
             valid_candidates,
         )
+        if self.collect_diagnostics:
+            self.last_run_diagnostics["successful_tool_calls"] = (
+                successful_tool_calls
+            )
+        return answer

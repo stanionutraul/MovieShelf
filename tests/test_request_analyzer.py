@@ -133,6 +133,46 @@ def test_unsupported_viewing_effort_criteria_are_removed():
     assert request.required_criteria == ["new_movie"]
     assert request.preferred_criteria == ["cozy_vibe"]
 
+def test_optional_romance_and_holiday_themes_are_not_search_criteria():
+    analyzer = MovieRequestAnalyzer(llm=FakeLLM(_result(
+        required_criteria=[
+            "romantic",
+            "holiday-themed",
+            "warm and comforting",
+        ],
+        preferred_criteria=["romantic or holiday-themed"],
+        genres_include=["Romance"],
+        genres_exclude=["Romance"],
+    )))
+
+    request = analyzer.analyze(
+        "It doesn't have to be romantic, holiday-themed, or any particular "
+        "genre. I want something warm and comforting."
+    )
+
+    assert request.non_constraints == ["romantic", "holiday-themed"]
+    assert request.required_criteria == ["warm and comforting"]
+    assert request.preferred_criteria == []
+    assert request.genres_include == []
+    assert request.genres_exclude == []
+
+
+def test_bonus_points_are_not_promoted_to_required_criteria():
+    analyzer = MovieRequestAnalyzer(llm=FakeLLM(_result(
+        required_criteria=["subtitles"],
+        preferred_criteria=["available on an OTT platform"],
+    )))
+
+    request = analyzer.analyze(
+        "Language is no bar and I am happy with subtitles. Bonus points "
+        "if it is available on an OTT platform."
+    )
+
+    assert request.required_criteria == []
+    assert request.preferred_criteria == [
+        "available on an OTT platform"
+    ]
+
 
 def test_context_builder_preserves_the_original_user_request():
     original_request = (
@@ -232,3 +272,51 @@ def test_explicit_content_avoidance_fails_closed_without_verified_data():
 
     assert "nu conține avertismente de conținut verificate" in result
     assert llm.prompt is None
+
+
+def test_viewing_experience_is_preserved():
+    result = {
+        "intent_summary": "A cozy, comforting and lighthearted movie.",
+        "viewing_experience": {
+            "atmosphere": ["cozy", "comforting", "warm"],
+            "tone": ["lighthearted", "feel-good"],
+            "mental_effort": "low",
+            "emotional_intensity": None,
+            "pacing": None,
+        },
+    }
+
+    analyzer = MovieRequestAnalyzer(llm=FakeLLM(result))
+
+    request = analyzer.analyze(
+        "I want something cozy, comforting, lighthearted and "
+        "that doesn't require too much mental energy."
+    )
+
+    assert request.viewing_experience.atmosphere == [
+        "cozy", "comforting", "warm"
+    ]
+    assert request.viewing_experience.tone == [
+        "lighthearted", "feel-good"
+    ]
+    assert request.viewing_experience.mental_effort == "low"
+    assert request.viewing_experience.emotional_intensity is None
+    assert request.viewing_experience.pacing is None
+
+
+def test_viewing_experience_does_not_infer_emotional_intensity():
+    result = {
+        "intent_summary": "A warm and feel-good movie.",
+        "viewing_experience": {
+            "atmosphere": ["warm"],
+            "tone": ["feel-good"],
+        },
+    }
+
+    analyzer = MovieRequestAnalyzer(llm=FakeLLM(result))
+
+    request = analyzer.analyze("Something warm and feel-good.")
+
+    assert request.viewing_experience.emotional_intensity is None
+    assert request.viewing_experience.mental_effort is None
+    assert request.viewing_experience.pacing is None
